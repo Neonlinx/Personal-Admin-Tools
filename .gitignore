@@ -1,0 +1,32 @@
+# Local/private configuration
+*.local.bat
+*.local.ps1
+*.local.json
+.env
+.env.*
+
+# Secrets / credentials
+secrets.*
+credentials.*
+
+# Generated logs/reports
+logs/
+*.log
+*.tmp
+*.bak
+*.zip
+
+# PowerShell / editor artifacts
+.vscode/*.log
+
+# Windows noise
+Thumbs.db
+Desktop.ini
+
+# Third-party utilities kept only in the local working copy
+Third-Party/Local/
+
+# Visual Studio generated files
+.vs/
+bin/
+obj/
