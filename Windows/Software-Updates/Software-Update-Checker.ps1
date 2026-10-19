@@ -4,15 +4,19 @@
     Controllo aggiornamenti dei programmi installati tramite winget.
 
     Parametri:
-      -Forza     : esegue il controllo anche se non è il giorno previsto
-      -Test      : SIMULAZIONE - mostra tutto a video e non modifica nulla
-      -Dettagli  : mostra tutto a video ma agisce davvero
+      -Forza        : esegue il controllo anche se non è il giorno previsto
+      -Test         : SIMULAZIONE - mostra tutto a video e non modifica nulla
+      -Dettagli     : mostra tutto a video ma agisce davvero
+      -ApriReport   : apre il report del mese corrente ed esce
+      -ApriCartella : apre la cartella dei report ed esce
 #>
 [CmdletBinding()]
 param(
     [switch]$Forza,
     [switch]$Test,
-    [switch]$Dettagli
+    [switch]$Dettagli,
+    [switch]$ApriReport,
+    [switch]$ApriCartella
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,8 +29,11 @@ $FileConfig     = Join-Path $CartellaScript 'config.json'
 $FileListe      = Join-Path $CartellaScript 'liste.json'
 $FileStato      = Join-Path $CartellaScript 'stato.json'
 
-# Finche' non leggiamo la config, eventuali errori vanno nella cartella dello script
+# Finché non leggiamo la config, eventuali errori vanno nella cartella dello script
 $script:CartellaLog = $CartellaScript
+
+# Perché è partito il controllo (lo scrive Test-DeveEseguire, lo legge il report)
+$script:MotivoEsecuzione = ''
 
 # ---------------------------------------------------------------
 #  FUNZIONI DI SUPPORTO
@@ -112,7 +119,11 @@ function Read-Liste {
 function Test-DeveEseguire {
     param($Config, $Stato)
 
-    if ($Forza) { Write-Log 'Esecuzione forzata (-Forza).'; return $true }
+    if ($Forza) {
+        $script:MotivoEsecuzione = 'esecuzione manuale'
+        Write-Log 'Esecuzione forzata (-Forza).'
+        return $true
+    }
 
     $oggi   = (Get-Date).Date
     $ultimo = $null
@@ -121,26 +132,40 @@ function Test-DeveEseguire {
         else { $ultimo = [datetime]::ParseExact([string]$Stato.UltimoControllo, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
     }
 
-    if ($ultimo -and $ultimo -eq $oggi) { Write-Log 'Controllo gia'' eseguito oggi.'; return $false }
-    if ((Get-Date).DayOfWeek.ToString() -eq $Config.GiornoControllo) { Write-Log 'Oggi e'' il giorno del controllo.'; return $true }
-    if (-not $ultimo) { Write-Log 'Nessun controllo precedente: primo avvio.'; return $true }
+    if ($ultimo -and $ultimo -eq $oggi) { Write-Log 'Controllo già eseguito oggi.'; return $false }
 
-    $giorni = ($oggi - $ultimo).TotalDays
-    if ($giorni -ge $Config.GiorniMassimiTraControlli) { Write-Log "Recupero: ultimo controllo $giorni giorni fa."; return $true }
+    if ((Get-Date).DayOfWeek.ToString() -eq $Config.GiornoControllo) {
+        $script:MotivoEsecuzione = 'esecuzione programmata'
+        Write-Log 'Oggi è il giorno del controllo.'
+        return $true
+    }
 
-    Write-Log 'Non e'' il giorno del controllo.'
+    if (-not $ultimo) {
+        $script:MotivoEsecuzione = 'primo avvio'
+        Write-Log 'Nessun controllo precedente: primo avvio.'
+        return $true
+    }
+
+    $giorni = [int]($oggi - $ultimo).TotalDays
+    if ($giorni -ge $Config.GiorniMassimiTraControlli) {
+        $script:MotivoEsecuzione = "recupero: ultimo controllo $giorni giorni fa"
+        Write-Log "Recupero: ultimo controllo $giorni giorni fa."
+        return $true
+    }
+
+    Write-Log 'Non è il giorno del controllo.'
     return $false
 }
 
 # ---------------------------------------------------------------
-#  FASE 1b - C'E' INTERNET?
+#  FASE 1b - C'È INTERNET?
 # ---------------------------------------------------------------
 function Wait-Internet {
     param([int]$Minuti)
 
     # Interroghiamo direttamente il server dell'archivio di winget
-    $url      = 'https://cdn.winget.microsoft.com/cache/source.msix'
-    $scadenza = (Get-Date).AddMinutes($Minuti)
+    $url       = 'https://cdn.winget.microsoft.com/cache/source.msix'
+    $scadenza  = (Get-Date).AddMinutes($Minuti)
     $tentativo = 0
 
     do {
@@ -171,7 +196,7 @@ function Get-Inventario {
                 elseif ($p.Id -like 'ARP\*')  { 'ARP' }
                 else { 'Altro' }
 
-        $installata = [string]$p.InstalledVersion
+        $installata  = [string]$p.InstalledVersion
         $disponibile = $null
         if ($p.AvailableVersions -and @($p.AvailableVersions).Count -gt 0) {
             $disponibile = [string]@($p.AvailableVersions)[0]
@@ -209,7 +234,7 @@ function Get-Inventario {
         }
     }
 
-    # Togliamo le voci MSIX "accessorie" che duplicano un programma gia' riconosciuto (es. Zed)
+    # Togliamo le voci MSIX "accessorie" che duplicano un programma già riconosciuto (es. Zed)
     $nomiWinget = @($risultato | Where-Object { $_.Tipo -notin 'MSIX','ARP','Altro' } | ForEach-Object { $_.Nome })
     return @($risultato | Where-Object { -not ($_.Tipo -eq 'MSIX' -and $nomiWinget -contains $_.Nome) })
 }
@@ -228,7 +253,7 @@ function Set-Classificazione {
     $regoleSospese   = @($Liste.AttenzioneRimossa)
     $nascondiSistema = [bool]$Config.EscludiComponentiSistema
 
-    # Storico dei fallimenti (lo scriverà la fase 4; per ora probabilmente non esiste)
+    # Storico dei fallimenti
     $fallimenti = $null
     if ($Stato -and $Stato.Fallimenti) { $fallimenti = $Stato.Fallimenti }
 
@@ -280,10 +305,10 @@ function Set-Classificazione {
         # --- Destinazione finale (solo per i programmi da aggiornare) ---
         $destinazione = ''
         if ($daAggiornare) {
-            if     ($escluso)                                                      { $destinazione = 'Escluso' }
-            elseif ($sistema -and $nascondiSistema)                                { $destinazione = 'Sistema' }
+            if     ($escluso)                                                           { $destinazione = 'Escluso' }
+            elseif ($sistema -and $nascondiSistema)                                     { $destinazione = 'Sistema' }
             elseif ($automatico -and -not $attenzione -and $p.Stato -eq 'Aggiornabile') { $destinazione = 'Automatico' }
-            else                                                                   { $destinazione = 'Finestra' }
+            else                                                                        { $destinazione = 'Finestra' }
         }
 
         # --- Aggiungiamo le nuove "colonne" alla riga di questo programma ---
@@ -495,17 +520,314 @@ function Show-RisultatiAggiornamenti {
 }
 
 # ---------------------------------------------------------------
+#  FASE 4 - REPORT E MEMORIA DELLO SCRIPT
+# ---------------------------------------------------------------
+
+function Update-InventarioDopoAggiornamenti {
+    <#
+        Dopo gli aggiornamenti riusciti, l'inventario letto all'inizio è "vecchio".
+        Correggiamo le righe dei programmi aggiornati, così report e stato.json
+        rispecchiano la situazione reale DOPO gli aggiornamenti.
+    #>
+    param($Inventario, $Risultati)
+
+    foreach ($r in @($Risultati | Where-Object { $_.Esito -eq 'OK' })) {
+        foreach ($p in @($Inventario | Where-Object { $_.Id -eq $r.Id })) {
+            $p.Installata   = $p.Disponibile
+            $p.Stato        = 'Aggiornato'
+            $p.Destinazione = ''
+        }
+    }
+}
+
+function Format-Cella {
+    <# Adatta un testo a una larghezza fissa: lo allunga con spazi o lo tronca con "~" #>
+    param([string]$Testo, [int]$Larghezza)
+    if ($null -eq $Testo) { $Testo = '' }
+    if ($Testo.Length -gt $Larghezza) { return $Testo.Substring(0, $Larghezza - 1) + '~' }
+    return $Testo.PadRight($Larghezza)
+}
+
+function Format-RigaProgramma {
+    <# Una riga di tabella: Nome | Installata | Disponibile | Note #>
+    param($Pacchetto)
+    $note = ''
+    if ($Pacchetto.MotiviAttenzione) { $note = '! ' + $Pacchetto.MotiviAttenzione }
+    return ('   {0} {1} {2} {3}' -f (Format-Cella $Pacchetto.Nome 40),
+                                    (Format-Cella $Pacchetto.Installata 22),
+                                    (Format-Cella $Pacchetto.Disponibile 22),
+                                    $note).TrimEnd()
+}
+
+function Get-Variazioni {
+    <#
+        Confronta l'inventario di oggi con quello salvato all'ultimo controllo.
+        Restituisce le righe già pronte per il report e il numero di variazioni MSIX (non mostrate).
+    #>
+    param($Inventario, $Precedente)
+
+    # "Rubriche" Id -> programma, per cercare velocemente
+    $vecchi = @{}
+    foreach ($v in @($Precedente)) { $vecchi[[string]$v.Id] = $v }
+    $nuovi = @{}
+    foreach ($n in @($Inventario)) { $nuovi[[string]$n.Id] = $n }
+
+    $righe = New-Object System.Collections.Generic.List[string]
+    $msix  = 0
+    $modello = '   {0} {1} {2}'   # etichetta | nome | versione/e
+
+    # Installati e aggiornati
+    foreach ($n in @($Inventario | Sort-Object Nome)) {
+        $v = $vecchi[[string]$n.Id]
+        $riga = $null
+        if (-not $v) {
+            $riga = $modello -f '[+] Installato   ', (Format-Cella $n.Nome 40), $n.Installata
+        }
+        elseif ([string]$v.Versione -ne [string]$n.Installata) {
+            $etichetta = if ((Compare-Versione $v.Versione $n.Installata) -eq 1) { '[v] Retrocesso   ' } else { '[^] Aggiornato   ' }
+            $riga = $modello -f $etichetta, (Format-Cella $n.Nome 40), "$($v.Versione) -> $($n.Installata)"
+        }
+        if ($riga) {
+            if ($n.Tipo -eq 'MSIX') { $msix++ } else { $righe.Add($riga.TrimEnd()) }
+        }
+    }
+
+    # Disinstallati
+    foreach ($v in @($Precedente | Sort-Object Nome)) {
+        if (-not $nuovi.ContainsKey([string]$v.Id)) {
+            if ($v.Tipo -eq 'MSIX') { $msix++ }
+            else { $righe.Add(($modello -f '[-] Disinstallato', (Format-Cella $v.Nome 40), $v.Versione).TrimEnd()) }
+        }
+    }
+
+    return [pscustomobject]@{ Righe = $righe; Msix = $msix }
+}
+
+function New-InventarioMensile {
+    <# L'inventario completo, scritto solo in cima al file alla prima esecuzione del mese #>
+    param($Inventario)
+
+    $cultura = [Globalization.CultureInfo]'it-IT'
+    $r = New-Object System.Collections.Generic.List[string]
+    $doppia = '=' * 100
+
+    $r.Add($doppia)
+    $r.Add(' REPORT AGGIORNAMENTI SOFTWARE - ' + (Get-Date).ToString('MMMM yyyy', $cultura).ToUpper())
+    $r.Add(' Inventario completo al ' + (Get-Date -Format 'dd/MM/yyyy HH:mm'))
+    $r.Add($doppia)
+
+    $gruppi = [ordered]@{
+        'RICONOSCIUTI DA WINGET'                         = @($Inventario | Where-Object { $_.Tipo -notin 'MSIX','ARP','Altro' })
+        'NON VERIFICABILI (winget li vede ma non li conosce)' = @($Inventario | Where-Object { $_.Tipo -in 'ARP','Altro' })
+        'COMPONENTI MSIX (app dello Store e di Windows)' = @($Inventario | Where-Object { $_.Tipo -eq 'MSIX' })
+    }
+
+    foreach ($titolo in $gruppi.Keys) {
+        $elenco = $gruppi[$titolo]
+        $r.Add('')
+        $r.Add(" $titolo  ($($elenco.Count))")
+        $r.Add('   ' + (Format-Cella 'Nome' 40) + ' ' + (Format-Cella 'Versione' 22) + ' Id')
+        foreach ($p in @($elenco | Sort-Object Nome)) {
+            $r.Add(('   {0} {1} {2}' -f (Format-Cella $p.Nome 40), (Format-Cella $p.Installata 22), $p.Id).TrimEnd())
+        }
+    }
+    $r.Add('')
+    return $r
+}
+
+function New-BloccoReport {
+    <# Costruisce, riga per riga, il blocco di testo di questo controllo #>
+    param($Inventario, $Stato, $RisultatiAuto)
+
+    $cultura   = [Globalization.CultureInfo]'it-IT'
+    $r         = New-Object System.Collections.Generic.List[string]
+    $doppia    = '=' * 100
+
+    $daAggiornare = @($Inventario | Where-Object { $_.Destinazione })
+    $finestra     = @($daAggiornare | Where-Object { $_.Destinazione -eq 'Finestra' })
+    $disponibili  = @($finestra     | Where-Object { $_.Stato -eq 'Aggiornabile' } | Sort-Object Nome)
+    $manuali      = @($finestra     | Where-Object { $_.Stato -eq 'SoloManuale' }  | Sort-Object Nome)
+    $esclusi      = @($daAggiornare | Where-Object { $_.Destinazione -eq 'Escluso' } | Sort-Object Nome)
+    $sistema      = @($daAggiornare | Where-Object { $_.Destinazione -eq 'Sistema' } | Sort-Object Nome)
+    $autoOk       = @($RisultatiAuto | Where-Object { $_.Esito -eq 'OK' })
+    $autoKo       = @($RisultatiAuto | Where-Object { $_.Esito -eq 'Fallito' })
+    $riavvio      = @($RisultatiAuto | Where-Object { $_.Riavvio })
+    $riconosciuti = @($Inventario | Where-Object { $_.Tipo -notin 'MSIX','ARP','Altro' }).Count
+
+    # --- Intestazione ---
+    $adesso = Get-Date
+    $r.Add('')
+    $r.Add($doppia)
+    $titolo = ' CONTROLLO DEL {0} ORE {1}  ({2} - {3})' -f $adesso.ToString('dd/MM/yyyy'), $adesso.ToString('HH:mm'),
+              $adesso.ToString('dddd', $cultura), $script:MotivoEsecuzione
+    $r.Add($titolo)
+    $r.Add($doppia)
+
+    if ($sistema.Count -gt 0) {
+        $r.Add(" !!! $($sistema.Count) componenti di sistema/hardware aggiornabili -> vedi sezione finale !!!")
+    }
+    if ($riavvio.Count -gt 0) {
+        $r.Add(' !!! Riavvio consigliato per: ' + (($riavvio | ForEach-Object { $_.Nome }) -join ', ') + ' !!!')
+    }
+
+    # --- Riepilogo ---
+    $voci = [ordered]@{
+        'Programmi installati'       = "$($Inventario.Count)  (riconosciuti da winget: $riconosciuti)"
+        'Aggiornabili'               = @($daAggiornare | Where-Object { $_.Stato -eq 'Aggiornabile' }).Count
+        'Solo aggiornamento manuale' = @($daAggiornare | Where-Object { $_.Stato -eq 'SoloManuale' }).Count
+        'Con flag Attenzione'        = @($daAggiornare | Where-Object { $_.Attenzione }).Count
+        'Esclusi'                    = $esclusi.Count
+        'Componenti di sistema'      = $sistema.Count
+        'Aggiornati in automatico'   = "$(@($RisultatiAuto).Count)  (riusciti: $($autoOk.Count), falliti: $($autoKo.Count))"
+    }
+    $r.Add('')
+    $r.Add(' RIEPILOGO')
+    foreach ($k in $voci.Keys) {
+        $riga = '   {0} {1}' -f ($k + ' ').PadRight(32, '.'), $voci[$k]
+        $r.Add($riga)
+    }
+
+    # --- Variazioni ---
+    $r.Add('')
+    if (-not $Stato.InventarioPrecedente) {
+        $r.Add(" VARIAZIONI DALL'ULTIMO CONTROLLO")
+        $r.Add('   Primo controllo: nessun confronto disponibile.')
+    }
+    else {
+        $dataPrec = [string]$Stato.UltimoControllo
+        if ($Stato.UltimoControllo -is [datetime]) { $dataPrec = $Stato.UltimoControllo.ToString('dd/MM/yyyy') }
+        elseif ($dataPrec -match '^(\d{4})-(\d{2})-(\d{2})') { $dataPrec = "$($Matches[3])/$($Matches[2])/$($Matches[1])" }
+
+        $var = Get-Variazioni -Inventario $Inventario -Precedente $Stato.InventarioPrecedente
+        $r.Add(" VARIAZIONI DALL'ULTIMO CONTROLLO ($dataPrec)")
+        if ($var.Righe.Count -eq 0) { $r.Add('   Nessuna variazione.') }
+        foreach ($riga in $var.Righe) { $r.Add($riga) }
+        if ($var.Msix -gt 0) { $r.Add("   (+ $($var.Msix) variazioni di componenti MSIX non mostrate)") }
+    }
+
+    # --- Aggiornamenti automatici ---
+    if (@($RisultatiAuto).Count -gt 0) {
+        $r.Add('')
+        $r.Add(' AGGIORNAMENTI AUTOMATICI ESEGUITI')
+        foreach ($x in @($RisultatiAuto | Sort-Object Nome)) {
+            $etichetta = switch ($x.Esito) { 'OK' {'[OK]     '} 'Fallito' {'[FALLITO]'} default {"[$($x.Esito)]"} }
+            $riga = '   {0} {1} {2} -> {3}' -f $etichetta, (Format-Cella $x.Nome 40), $x.Da, $x.A
+            if ($x.Esito -eq 'Fallito') { $riga += "   ($($x.Messaggio) $($x.Codice))".Replace(' )', ')') }
+            $r.Add($riga.TrimEnd())
+        }
+    }
+
+    # --- Disponibili ---
+    $intestazione = '   ' + (Format-Cella 'Nome' 40) + ' ' + (Format-Cella 'Installata' 22) + ' ' + (Format-Cella 'Disponibile' 22) + ' Note'
+    $r.Add('')
+    $r.Add(' AGGIORNAMENTI DISPONIBILI')
+    if ($disponibili.Count -eq 0) { $r.Add('   Nessuno.') }
+    else {
+        $r.Add($intestazione)
+        foreach ($p in $disponibili) { $r.Add((Format-RigaProgramma $p)) }
+    }
+
+    # --- Solo manuali ---
+    if ($manuali.Count -gt 0) {
+        $r.Add('')
+        $r.Add(' DA AGGIORNARE A MANO (winget non può: usa il sito o il programma stesso)')
+        foreach ($p in $manuali) { $r.Add((Format-RigaProgramma $p)) }
+    }
+
+    # --- Esclusi ---
+    if ($esclusi.Count -gt 0) {
+        $r.Add('')
+        $r.Add(' ESCLUSI')
+        foreach ($p in $esclusi) { $r.Add((Format-RigaProgramma $p)) }
+    }
+
+    # --- Sistema (sempre per ultima, ben visibile) ---
+    $cornice = ' ' + ('#' * 98)
+    $r.Add('')
+    $r.Add($cornice)
+    $r.Add(' ##   COMPONENTI DI SISTEMA / HARDWARE'.PadRight(97) + '##')
+    $r.Add($cornice)
+    if ($sistema.Count -eq 0) { $r.Add('   Nessun componente da aggiornare.') }
+    else { foreach ($p in $sistema) { $r.Add((Format-RigaProgramma $p)) } }
+    $r.Add('')
+
+    return $r
+}
+
+function Write-Report {
+    <#
+        Aggiunge il blocco al file del mese. Se il file non esiste ancora
+        (prima esecuzione del mese) scrive prima l'inventario completo.
+        In modalità -Test non scrive nulla: mostra il testo a video.
+    #>
+    param($Inventario, $Blocco, [string]$Cartella)
+
+    $file   = Join-Path $Cartella ('Report_{0}.txt' -f (Get-Date -Format 'yyyy-MM'))
+    $testo  = New-Object System.Collections.Generic.List[string]
+    $nuovo  = -not (Test-Path -LiteralPath $file)
+
+    if ($nuovo) { $testo.AddRange([string[]](New-InventarioMensile $Inventario)) }
+    $testo.AddRange([string[]]$Blocco)
+
+    if ($Test) {
+        Write-Host ''
+        Write-Host "=== ANTEPRIMA REPORT (non scritto) -> $file ===" -ForegroundColor Cyan
+        if ($nuovo) { Write-Host '(file nuovo: verrebbe scritto anche l''inventario completo, qui omesso)' -ForegroundColor DarkGray }
+        $Blocco | ForEach-Object { Write-Host $_ }
+        return
+    }
+
+    # UTF-8 con BOM: così il Blocco note e qualsiasi editor mostrano correttamente gli accenti
+    $codifica = New-Object System.Text.UTF8Encoding($true)
+    [IO.File]::AppendAllText($file, (($testo -join "`r`n") + "`r`n"), $codifica)
+    Write-Log "Report scritto: $file"
+}
+
+function Save-Stato {
+    <#
+        Salva la "memoria" dello script. Scrive prima un file temporaneo e poi lo
+        sostituisce all'originale: se il PC si spegne a metà, stato.json non resta corrotto.
+    #>
+    param($Stato, $Inventario)
+
+    $daSalvare = [pscustomobject]@{
+        UltimoControllo      = (Get-Date -Format 'yyyy-MM-dd')
+        Fallimenti           = $Stato.Fallimenti
+        InventarioPrecedente = @($Inventario | ForEach-Object {
+            [pscustomobject]@{ Id = $_.Id; Nome = $_.Nome; Versione = $_.Installata; Tipo = $_.Tipo }
+        })
+    }
+
+    $json        = $daSalvare | ConvertTo-Json -Depth 5
+    $temporaneo  = "$FileStato.tmp"
+    $codifica    = New-Object System.Text.UTF8Encoding($true)
+    [IO.File]::WriteAllText($temporaneo, $json, $codifica)
+    Move-Item -LiteralPath $temporaneo -Destination $FileStato -Force
+    Write-Log 'Stato salvato.'
+}
+
+# ---------------------------------------------------------------
 #  PROGRAMMA PRINCIPALE
 # ---------------------------------------------------------------
 try {
     $config = Read-Json $FileConfig
     if (-not $config) { throw "File di configurazione non trovato: $FileConfig" }
 
+    # Scorciatoie per il menu contestuale: aprono report o cartella ed escono subito
+    if ($ApriReport -or $ApriCartella) {
+        $fileMese = Join-Path $config.CartellaReport ('Report_{0}.txt' -f (Get-Date -Format 'yyyy-MM'))
+        if ($ApriReport -and (Test-Path -LiteralPath $fileMese)) { Invoke-Item -LiteralPath $fileMese }
+        elseif (Test-Path -LiteralPath $config.CartellaReport)   { Invoke-Item -LiteralPath $config.CartellaReport }
+        return
+    }
+
     # Cartella report: la creiamo se manca; se non si può (es. disco D: assente) ripieghiamo
+    $cartellaReport = $CartellaScript
     try {
         if (-not (Test-Path -LiteralPath $config.CartellaReport)) {
             New-Item -ItemType Directory -Path $config.CartellaReport -Force | Out-Null
         }
+        $cartellaReport     = $config.CartellaReport
         $script:CartellaLog = $config.CartellaReport
     }
     catch {
@@ -545,6 +867,13 @@ try {
     else {
         Write-Log 'Nessun aggiornamento automatico da eseguire.'
     }
+
+    # --- Fase 4: report e memoria ---
+    Update-InventarioDopoAggiornamenti -Inventario $inventario -Risultati $risultatiAuto
+    $blocco = New-BloccoReport -Inventario $inventario -Stato $stato -RisultatiAuto $risultatiAuto
+    Write-Report -Inventario $inventario -Blocco $blocco -Cartella $cartellaReport
+
+    if (-not $Test) { Save-Stato -Stato $stato -Inventario $inventario }
 }
 catch {
     Write-Log "Errore non gestito: $($_.Exception.Message)" 'ERRORE'
