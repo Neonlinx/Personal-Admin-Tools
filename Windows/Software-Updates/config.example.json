@@ -1,0 +1,23 @@
+{
+  "CartellaReport": "C:\\Percorso\\Della\\Cartella\\Report",
+  "GiornoControllo": "Saturday",
+  "GiorniMassimiTraControlli": 7,
+  "AttesaInternetMinuti": 10,
+  "EscludiComponentiSistema": true,
+  "CriteriSistema": [
+    "Microsoft.DotNet.*",
+    "Microsoft.VCRedist.*",
+    "Microsoft.VCLibs.*",
+    "Microsoft.UI.Xaml.*",
+    "Microsoft.WindowsAppRuntime.*",
+    "Microsoft.WindowsADK*",
+    "Microsoft.WindowsSDK*",
+    "Microsoft.msodbcsql*",
+    "Microsoft.AppInstaller",
+    "AMD.*",
+    "Intel.*",
+    "NVIDIA.*",
+    "Realtek.*",
+    "Corsair.*"
+  ]
+}

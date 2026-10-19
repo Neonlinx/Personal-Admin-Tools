@@ -30,3 +30,7 @@ Third-Party/Local/
 .vs/
 bin/
 obj/
+
+# Software-Updates: dati personali (configurazione, liste, inventario)
+Windows/Software-Updates/*.json
+!Windows/Software-Updates/*.example.json
