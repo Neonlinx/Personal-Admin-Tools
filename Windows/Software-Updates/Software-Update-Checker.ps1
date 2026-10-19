@@ -2,16 +2,17 @@
 <#
     Software-Update-Checker.ps1
     Controllo aggiornamenti dei programmi installati tramite winget.
-    FASE 1: impostazioni, controlli iniziali, inventario.
 
     Parametri:
-      -Forza  : esegue il controllo anche se non e' il giorno previsto
-      -Test   : mostra tutto a video e non modifica nulla
+      -Forza     : esegue il controllo anche se non è il giorno previsto
+      -Test      : SIMULAZIONE - mostra tutto a video e non modifica nulla
+      -Dettagli  : mostra tutto a video ma agisce davvero
 #>
 [CmdletBinding()]
 param(
     [switch]$Forza,
-    [switch]$Test
+    [switch]$Test,
+    [switch]$Dettagli
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,7 +39,7 @@ function Write-Log {
     )
     $riga = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Livello, $Messaggio
 
-    if ($Test) {
+    if ($Test -or $Dettagli) {
         $colore = switch ($Livello) { 'ERRORE' {'Red'} 'AVVISO' {'Yellow'} default {'Gray'} }
         Write-Host $riga -ForegroundColor $colore
     }
@@ -326,6 +327,174 @@ function Show-RiepilogoTest {
 }
 
 # ---------------------------------------------------------------
+#  FASE 3 - MOTORE DEGLI AGGIORNAMENTI
+# ---------------------------------------------------------------
+
+# Codici di uscita di winget che sappiamo interpretare (dalla documentazione ufficiale)
+$script:CodiciWinget = @{
+    '0x8A150109' = @{ Esito = 'OK';      Riavvio = $true;  Testo = 'Installato: serve un riavvio per completare' }
+    '0x8A15010D' = @{ Esito = 'OK';      Riavvio = $false; Testo = 'Versione già installata' }
+    '0x8A15010A' = @{ Esito = 'Fallito'; Riavvio = $true;  Testo = 'Serve un riavvio PRIMA di poter installare' }
+    '0x8A150101' = @{ Esito = 'Fallito'; Riavvio = $false; Testo = 'Il programma è in uso: chiudilo e riprova' }
+    '0x8A150103' = @{ Esito = 'Fallito'; Riavvio = $false; Testo = 'Un file del programma è in uso' }
+    '0x8A150105' = @{ Esito = 'Fallito'; Riavvio = $false; Testo = 'Spazio su disco insufficiente' }
+    '0x8A150107' = @{ Esito = 'Fallito'; Riavvio = $false; Testo = 'Problema di rete durante l''installazione' }
+    '0x8A15002B' = @{ Esito = 'Fallito'; Riavvio = $false; Testo = 'Nessun aggiornamento applicabile al sistema' }
+}
+
+function Initialize-Stato {
+    <# Prepara l'oggetto "stato" con tutte le sue parti, anche se stato.json non esiste ancora #>
+    param($Stato)
+    if (-not $Stato) { $Stato = [pscustomobject]@{} }
+    if ($Stato.PSObject.Properties.Name -notcontains 'Fallimenti' -or $null -eq $Stato.Fallimenti) {
+        $Stato | Add-Member -Force -NotePropertyName 'Fallimenti' -NotePropertyValue ([pscustomobject]@{})
+    }
+    return $Stato
+}
+
+function Test-Amministratore {
+    $identita   = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principale = New-Object Security.Principal.WindowsPrincipal($identita)
+    return $principale.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function New-PuntoRipristino {
+    try {
+        Checkpoint-Computer -Description 'Software-Update-Checker' -RestorePointType 'APPLICATION_INSTALL' `
+                            -WarningAction SilentlyContinue -WarningVariable avvisi
+        if ($avvisi) { Write-Log "Punto di ripristino non creato: $($avvisi[0].Message)" }
+        else         { Write-Log 'Punto di ripristino creato.' }
+    }
+    catch {
+        Write-Log "Punto di ripristino non creato: $($_.Exception.Message)" 'AVVISO'
+    }
+}
+
+function Invoke-Aggiornamento {
+    <# Aggiorna UN programma e restituisce l'esito #>
+    param($Pacchetto, [int]$TimeoutMinuti = 15)
+
+    $argomenti = @('upgrade', '--id', $Pacchetto.Id, '--exact', '--silent',
+                   '--accept-package-agreements', '--accept-source-agreements',
+                   '--disable-interactivity')
+
+    $risultato = [pscustomobject]@{
+        Nome      = $Pacchetto.Nome
+        Id        = $Pacchetto.Id
+        Da        = $Pacchetto.Installata
+        A         = $Pacchetto.Disponibile
+        Esito     = ''
+        Riavvio   = $false
+        Codice    = ''
+        Messaggio = ''
+    }
+
+    # In simulazione ci limitiamo a dire cosa faremmo
+    if ($Test) {
+        $risultato.Esito     = 'Simulato'
+        $risultato.Messaggio = "winget $($argomenti -join ' ')"
+        return $risultato
+    }
+
+    $fileOutput = [IO.Path]::GetTempFileName()
+    $fileErrori = [IO.Path]::GetTempFileName()
+    try {
+        Write-Log "Aggiornamento di $($Pacchetto.Nome) ($($Pacchetto.Installata) -> $($Pacchetto.Disponibile))..."
+
+        $processo = Start-Process -FilePath 'winget' -ArgumentList $argomenti -NoNewWindow -PassThru `
+                                  -RedirectStandardOutput $fileOutput -RedirectStandardError $fileErrori
+        $null = $processo.Handle   # trucco tecnico: serve per poter leggere il codice di uscita alla fine
+
+        # Attesa con limite di tempo (il valore è in millisecondi)
+        if (-not $processo.WaitForExit($TimeoutMinuti * 60 * 1000)) {
+            & taskkill.exe /PID $processo.Id /T /F | Out-Null
+            $risultato.Esito     = 'Fallito'
+            $risultato.Messaggio = "Interrotto: superato il limite di $TimeoutMinuti minuti"
+            return $risultato
+        }
+
+        $codice = $processo.ExitCode
+        $ultimaRiga = Get-Content -LiteralPath $fileOutput -Encoding UTF8 -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Trim() } | Select-Object -Last 1
+
+        if ($null -eq $codice) {
+            $risultato.Esito     = 'Fallito'
+            $risultato.Messaggio = "Codice di uscita non disponibile. Ultima riga di winget: $ultimaRiga"
+        }
+        elseif ($codice -eq 0) {
+            $risultato.Codice    = '0x00000000'
+            $risultato.Esito     = 'OK'
+            $risultato.Messaggio = 'Aggiornato correttamente'
+        }
+        else {
+            $risultato.Codice = '0x{0:X8}' -f $codice
+            if ($script:CodiciWinget.ContainsKey($risultato.Codice)) {
+                $info = $script:CodiciWinget[$risultato.Codice]
+                $risultato.Esito     = $info.Esito
+                $risultato.Riavvio   = $info.Riavvio
+                $risultato.Messaggio = $info.Testo
+            }
+            else {
+                $risultato.Esito     = 'Fallito'
+                $risultato.Messaggio = "Codice non previsto. Ultima riga di winget: $ultimaRiga"
+            }
+        }
+    }
+    catch {
+        $risultato.Esito     = 'Fallito'
+        $risultato.Messaggio = "Errore nell'avvio di winget: $($_.Exception.Message)"
+    }
+    finally {
+        Remove-Item -LiteralPath $fileOutput, $fileErrori -Force -ErrorAction SilentlyContinue
+    }
+
+    return $risultato
+}
+
+function Invoke-Aggiornamenti {
+    <# Aggiorna un ELENCO di programmi: punto di ripristino, ordine, storico fallimenti #>
+    param($Pacchetti, $Stato)
+
+    # Ordine: tutti in ordine alfabetico, App Installer (winget stesso) sempre per ultimo
+    $ordinati = @($Pacchetti | Sort-Object @{ Expression = { $_.Id -eq 'Microsoft.AppInstaller' } }, Nome)
+
+    if (-not $Test) {
+        if (-not (Test-Amministratore)) {
+            Write-Log 'Lo script non ha i permessi di amministratore: alcuni aggiornamenti potrebbero fallire.' 'AVVISO'
+        }
+        New-PuntoRipristino
+    }
+
+    $risultati = foreach ($p in $ordinati) {
+        $r = Invoke-Aggiornamento -Pacchetto $p
+
+        if ($r.Esito -eq 'OK') {
+            $Stato.Fallimenti.PSObject.Properties.Remove($p.Id)
+            Write-Log "OK: $($p.Nome)"
+        }
+        elseif ($r.Esito -eq 'Fallito') {
+            $Stato.Fallimenti | Add-Member -Force -NotePropertyName $p.Id -NotePropertyValue ([pscustomobject]@{
+                Data      = (Get-Date -Format 'yyyy-MM-dd')
+                Codice    = $r.Codice
+                Messaggio = $r.Messaggio
+            })
+            Write-Log "FALLITO: $($p.Nome) - $($r.Messaggio) [$($r.Codice)]" 'AVVISO'
+        }
+
+        $r   # "consegna" il risultato all'elenco $risultati
+    }
+
+    return @($risultati)
+}
+
+function Show-RisultatiAggiornamenti {
+    param($Risultati, [string]$Titolo)
+    Write-Host ''
+    Write-Host "=== $Titolo ===" -ForegroundColor Cyan
+    $Risultati | Format-Table Nome, Da, A, Esito, Riavvio, Codice, Messaggio -AutoSize -Wrap | Out-Host
+}
+
+# ---------------------------------------------------------------
 #  PROGRAMMA PRINCIPALE
 # ---------------------------------------------------------------
 try {
@@ -343,7 +512,7 @@ try {
         Write-Log "Impossibile usare la cartella report '$($config.CartellaReport)': $($_.Exception.Message). Uso la cartella dello script." 'AVVISO'
     }
 
-    $stato = Read-Json $FileStato
+    $stato = Initialize-Stato (Read-Json $FileStato)
     $liste = Read-Liste
 
     if (-not (Test-DeveEseguire $config $stato)) { return }
@@ -355,16 +524,29 @@ try {
         return
     }
 
+    # --- Fase 1: inventario ---
     Write-Log 'Lettura inventario in corso...'
     $inventario = Get-Inventario
     Write-Log "Inventario letto: $($inventario.Count) voci."
 
+    # --- Fase 2: classificazione ---
     Write-Log 'Classificazione in corso...'
     Set-Classificazione -Inventario $inventario -Config $config -Liste $liste -Stato $stato
+    if ($Test -or $Dettagli) { Show-RiepilogoTest $inventario }
 
-    if ($Test) { Show-RiepilogoTest $inventario }
+    # --- Fase 3: aggiornamenti automatici ---
+    $automatici    = @($inventario | Where-Object { $_.Destinazione -eq 'Automatico' })
+    $risultatiAuto = @()
+    if ($automatici.Count -gt 0) {
+        Write-Log "Aggiornamenti automatici da eseguire: $($automatici.Count)"
+        $risultatiAuto = Invoke-Aggiornamenti -Pacchetti $automatici -Stato $stato
+        if ($Test -or $Dettagli) { Show-RisultatiAggiornamenti $risultatiAuto 'AGGIORNAMENTI AUTOMATICI' }
+    }
+    else {
+        Write-Log 'Nessun aggiornamento automatico da eseguire.'
+    }
 }
 catch {
     Write-Log "Errore non gestito: $($_.Exception.Message)" 'ERRORE'
-    if ($Test) { throw }
+    if ($Test -or $Dettagli) { throw }
 }
