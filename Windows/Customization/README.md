@@ -1,4 +1,4 @@
-# Windows Diagnostic Tools
+# Windows Customization Tools
 
-- `Collect-Windows-Logs.ps1` gathers Windows servicing/update/event diagnostics for troubleshooting. Running from an elevated PowerShell session is recommended.
-- `Get-Windows-Update-Health.ps1` inspects update history, Windows Update events, online package states and pending-reboot indicators. Run it as Administrator.
+- UltraUXThemePatcher_Manager.ps1: è un utility interattiva per gestire i permessi dei file usati da UltraUXThemePatcher. Da avviare con PowerShell come amministratore.
+- Nilesoft-Shell: configurazione personale di [Nilesoft Shell](https://nilesoft.org) per il menu contestuale di Windows 11. Vedi `Windows/Customization/Nilesoft-Shell/README.md` per dettagli.
