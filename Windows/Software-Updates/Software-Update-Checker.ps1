@@ -7,6 +7,8 @@
       -Forza        : esegue il controllo anche se non è il giorno previsto
       -Test         : SIMULAZIONE - mostra tutto a video e non modifica nulla
       -Dettagli     : mostra tutto a video ma agisce davvero
+      -Info         : apre la finestra in sola consultazione (nessun aggiornamento,
+                      nessun report, non conta come controllo del sabato)
       -ApriReport   : apre il report del mese corrente ed esce
       -ApriCartella : apre la cartella dei report ed esce
 #>
@@ -15,6 +17,7 @@ param(
     [switch]$Forza,
     [switch]$Test,
     [switch]$Dettagli,
+    [switch]$Info,
     [switch]$ApriReport,
     [switch]$ApriCartella
 )
@@ -35,6 +38,10 @@ $script:CartellaLog = $CartellaScript
 # Perché è partito il controllo (lo scrive Test-DeveEseguire, lo legge il report)
 $script:MotivoEsecuzione = ''
 
+# Tutte le righe di log della sessione: la finestra le mostra quando si apre
+$script:LogSessione = New-Object System.Collections.Generic.List[object]
+$script:BoxLog = $null
+
 # ---------------------------------------------------------------
 #  FUNZIONI DI SUPPORTO
 # ---------------------------------------------------------------
@@ -50,6 +57,10 @@ function Write-Log {
         $colore = switch ($Livello) { 'ERRORE' {'Red'} 'AVVISO' {'Yellow'} default {'Gray'} }
         Write-Host $riga -ForegroundColor $colore
     }
+
+    # Memoria della sessione + pannello di log della finestra (se aperta)
+    $script:LogSessione.Add([pscustomobject]@{ Riga = $riga; Livello = $Livello })
+    Add-LogFinestra $riga $Livello
 
     # Sul file finiscono solo avvisi ed errori
     if ($Livello -ne 'INFO') {
@@ -807,6 +818,489 @@ function Save-Stato {
 }
 
 # ---------------------------------------------------------------
+#  FASE 5 - FINESTRA (tappa 5a: visualizzazione, filtri, log)
+# ---------------------------------------------------------------
+
+# Testi "umani" per stati e tipi
+$script:NomiStato = @{
+    'Aggiornabile'    = 'Aggiornabile'
+    'SoloManuale'     = 'Solo manuale'
+    'Aggiornato'      = 'Aggiornato'
+    'NonVerificabile' = 'Non verificabile'
+}
+
+function Get-TipoLeggibile {
+    param([string]$Tipo)
+    switch ($Tipo) {
+        'MSIX'  { return 'MSIX' }
+        'ARP'   { return 'Non verificabile (ARP)' }
+        'Altro' { return 'Non verificabile (ARP)' }
+        default { return 'winget' }
+    }
+}
+
+function Get-InfoControlli {
+    <# Testi per l'intestazione: ultimo controllo e prossimo controllo previsto #>
+    param($Config, $Stato)
+
+    $cultura = [Globalization.CultureInfo]'it-IT'
+    $oggi    = (Get-Date).Date
+    $ultimo  = $null
+    if ($Stato -and $Stato.UltimoControllo) {
+        if ($Stato.UltimoControllo -is [datetime]) { $ultimo = $Stato.UltimoControllo.Date }
+        else { $ultimo = [datetime]::ParseExact([string]$Stato.UltimoControllo, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
+    }
+
+    $testoUltimo = 'mai eseguito'
+    if ($ultimo) { $testoUltimo = $ultimo.ToString('ddd dd/MM/yyyy', $cultura) }
+
+    # Prossimo giorno di controllo (oggi compreso, se oggi non è ancora stato fatto)
+    $prossimo = $oggi
+    while ($prossimo.DayOfWeek.ToString() -ne $Config.GiornoControllo -or ($ultimo -and $prossimo -eq $ultimo)) {
+        $prossimo = $prossimo.AddDays(1)
+    }
+    $testoProssimo = $prossimo.ToString('ddd dd/MM/yyyy', $cultura)
+    if (-not $ultimo) { $testoProssimo = 'al prossimo accesso (primo controllo)' }
+    if ($ultimo -and ($oggi - $ultimo).TotalDays -ge $Config.GiorniMassimiTraControlli) {
+        $testoProssimo = 'in ritardo: al prossimo accesso'
+    }
+
+    return [pscustomobject]@{ Ultimo = $testoUltimo; Prossimo = $testoProssimo }
+}
+
+function Select-Programmi {
+    <#
+        Applica i filtri a un elenco di programmi. Funzione "pura" (non tocca la finestra),
+        così si può collaudare anche senza interfaccia grafica.
+          -Testo      : cerca in nome e ID (ignora maiuscole/minuscole)
+          -Stato      : Tutti | Aggiornabile | SoloManuale | Aggiornato | NonVerificabile
+          -Attenzione : Tutti | Con | Senza
+          -Tipo       : Tutti | winget | ARP | MSIX
+          -Lista      : Tutti | Automatici | Esclusi | Segnalati | Sistema
+    #>
+    param($Elenco, [string]$Testo = '', [string]$Stato = 'Tutti', [string]$Attenzione = 'Tutti',
+          [string]$Tipo = 'Tutti', [string]$Lista = 'Tutti', $Liste)
+
+    $segnalati = @()
+    if ($Liste) { $segnalati = @($Liste.Attenzione) }
+
+    $confronto = [StringComparison]::OrdinalIgnoreCase
+    $risultato = foreach ($p in @($Elenco)) {
+        if ($Testo -and ([string]$p.Nome).IndexOf($Testo, $confronto) -lt 0 -and ([string]$p.Id).IndexOf($Testo, $confronto) -lt 0) { continue }
+        if ($Stato -ne 'Tutti' -and $p.Stato -ne $Stato) { continue }
+        if ($Attenzione -eq 'Con'   -and -not $p.Attenzione) { continue }
+        if ($Attenzione -eq 'Senza' -and $p.Attenzione) { continue }
+        if ($Tipo -ne 'Tutti') {
+            $t = 'winget'
+            if ($p.Tipo -eq 'MSIX') { $t = 'MSIX' }
+            elseif ($p.Tipo -in 'ARP', 'Altro') { $t = 'ARP' }
+            if ($t -ne $Tipo) { continue }
+        }
+        # (niente "continue" dentro switch: in PowerShell lo switch è un ciclo a sé)
+        if ($Lista -eq 'Automatici' -and -not $p.Automatico)          { continue }
+        if ($Lista -eq 'Esclusi'    -and -not $p.Escluso)             { continue }
+        if ($Lista -eq 'Segnalati'  -and $segnalati -notcontains $p.Id) { continue }
+        if ($Lista -eq 'Sistema'    -and -not $p.Sistema)             { continue }
+        $p
+    }
+    return @($risultato)
+}
+
+function Add-LogFinestra {
+    <# Scrive una riga nel pannello di log della finestra, se è aperta #>
+    param([string]$Riga, [string]$Livello)
+    $box = $script:BoxLog
+    if (-not $box -or $box.IsDisposed) { return }
+    $colore = switch ($Livello) {
+        'ERRORE' { [Drawing.Color]::FromArgb(255, 110, 110) }
+        'AVVISO' { [Drawing.Color]::FromArgb(240, 200, 80) }
+        default  { [Drawing.Color]::FromArgb(190, 190, 190) }
+    }
+    $box.SelectionStart  = $box.TextLength
+    $box.SelectionLength = 0
+    $box.SelectionColor  = $colore
+    $box.AppendText($Riga + "`r`n")
+    $box.ScrollToCaret()
+}
+
+function Show-Attesa {
+    <# Piccola finestra "Caricamento..." mentre si legge l'inventario #>
+    param([string]$Testo)
+    Initialize-Grafica
+    $f = New-Object Windows.Forms.Form
+    $f.Text = 'Software Update Checker'
+    $f.FormBorderStyle = 'FixedToolWindow'
+    $f.StartPosition = 'CenterScreen'
+    $f.ClientSize = New-Object Drawing.Size(380, 70)
+    $f.TopMost = $true
+    $l = New-Object Windows.Forms.Label
+    $l.Text = $Testo
+    $l.Dock = 'Fill'
+    $l.TextAlign = 'MiddleCenter'
+    $l.Font = New-Object Drawing.Font('Segoe UI', 10)
+    $f.Controls.Add($l)
+    $f.Show()
+    [Windows.Forms.Application]::DoEvents()
+    return $f
+}
+
+$script:GraficaPronta = $false
+function Initialize-Grafica {
+    if ($script:GraficaPronta) { return }
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    # Testo nitido sugli schermi ad alta risoluzione
+    try {
+        Add-Type -Namespace SUC -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();' -ErrorAction Stop
+        [void][SUC.Dpi]::SetProcessDPIAware()
+    } catch { }
+    [Windows.Forms.Application]::EnableVisualStyles()
+    $script:GraficaPronta = $true
+}
+
+function New-Vista {
+    <#
+        Crea un elenco (ListView) con la sua barra dei filtri e il contatore.
+        Restituisce un oggetto "vista" che contiene tutto ciò che serve per aggiornarlo.
+    #>
+    param(
+        [Windows.Forms.Control]$Contenitore,
+        [scriptblock]$Fonte,          # restituisce l'elenco dei programmi da mostrare
+        [object[]]$Colonne,           # @{ Titolo; Proprieta; Larghezza }
+        [string[]]$Filtri,            # quali filtri mostrare: Stato, Attenzione, Tipo, Lista
+        [switch]$Caselle
+    )
+
+    $vista = [pscustomobject]@{
+        Lista     = $null
+        Fonte     = $Fonte
+        Colonne   = $Colonne
+        Contatore = $null
+        Testo     = $null
+        Combo     = @{}
+        Ordine    = [pscustomobject]@{ Colonna = $Colonne[0].Proprieta; Discendente = $false }
+    }
+
+    # --- barra dei filtri ---
+    $barra = New-Object Windows.Forms.FlowLayoutPanel
+    $barra.Dock = 'Top'
+    $barra.Height = 34
+    $barra.WrapContents = $false
+    $barra.Padding = New-Object Windows.Forms.Padding(4, 4, 4, 0)
+
+    $lbl = New-Object Windows.Forms.Label
+    $lbl.Text = 'Cerca:'
+    $lbl.AutoSize = $true
+    $lbl.Margin = New-Object Windows.Forms.Padding(0, 6, 4, 0)
+    $barra.Controls.Add($lbl)
+
+    $vista.Testo = New-Object Windows.Forms.TextBox
+    $vista.Testo.Width = 220
+    $vista.Testo.Tag = $vista
+    $vista.Testo.Add_TextChanged({ Update-Vista $this.Tag })
+    $barra.Controls.Add($vista.Testo)
+
+    $voci = @{
+        'Stato'      = @('Tutti', 'Aggiornabile', 'Solo manuale', 'Aggiornato', 'Non verificabile')
+        'Attenzione' = @('Tutti', 'Con flag Attenzione', 'Senza flag Attenzione')
+        'Tipo'       = @('Tutti', 'winget', 'Non verificabile (ARP)', 'MSIX')
+        'Lista'      = @('Tutti', 'Automatici', 'Esclusi', 'Segnalati', 'Sistema')
+    }
+    foreach ($nome in $Filtri) {
+        $l2 = New-Object Windows.Forms.Label
+        $l2.Text = "$($nome):"
+        $l2.AutoSize = $true
+        $l2.Margin = New-Object Windows.Forms.Padding(12, 6, 4, 0)
+        $barra.Controls.Add($l2)
+
+        $cb = New-Object Windows.Forms.ComboBox
+        $cb.DropDownStyle = 'DropDownList'
+        $cb.Width = 170
+        [void]$cb.Items.AddRange($voci[$nome])
+        $cb.SelectedIndex = 0
+        $cb.Tag = $vista
+        $cb.Add_SelectedIndexChanged({ Update-Vista $this.Tag })
+        $barra.Controls.Add($cb)
+        $vista.Combo[$nome] = $cb
+    }
+
+    # --- elenco ---
+    $lv = New-Object Windows.Forms.ListView
+    $lv.Dock = 'Fill'
+    $lv.View = 'Details'
+    $lv.FullRowSelect = $true
+    $lv.GridLines = $true
+    $lv.HideSelection = $false
+    $lv.CheckBoxes = [bool]$Caselle
+    $lv.Tag = $vista
+    foreach ($c in $Colonne) { [void]$lv.Columns.Add($c.Titolo, $c.Larghezza) }
+
+    # Clic sull'intestazione = ordina (secondo clic = ordine inverso)
+    $lv.Add_ColumnClick({
+        param($s, $e)
+        $v = $s.Tag
+        $prop = $v.Colonne[$e.Column].Proprieta
+        if ($v.Ordine.Colonna -eq $prop) { $v.Ordine.Discendente = -not $v.Ordine.Discendente }
+        else { $v.Ordine.Colonna = $prop; $v.Ordine.Discendente = $false }
+        Update-Vista $v
+    })
+
+    # I programmi "solo manuale" non si possono spuntare: winget non può aggiornarli
+    $lv.Add_ItemCheck({
+        param($s, $e)
+        $p = $s.Items[$e.Index].Tag
+        if ($p -and $p.Stato -eq 'SoloManuale') { $e.NewValue = [Windows.Forms.CheckState]::Unchecked }
+    })
+    $vista.Lista = $lv
+
+    # --- contatore ---
+    $vista.Contatore = New-Object Windows.Forms.Label
+    $vista.Contatore.Dock = 'Bottom'
+    $vista.Contatore.Height = 20
+    $vista.Contatore.TextAlign = 'MiddleRight'
+
+    # L'ordine di aggiunta conta: Fill va aggiunto per primo
+    $Contenitore.Controls.Add($lv)
+    $Contenitore.Controls.Add($barra)
+    $Contenitore.Controls.Add($vista.Contatore)
+
+    return $vista
+}
+
+function Update-Vista {
+    <# Riempie l'elenco applicando filtri e ordinamento #>
+    param($Vista)
+
+    $tutti = @(& $Vista.Fonte)
+
+    $mappaStato = @{ 'Aggiornabile' = 'Aggiornabile'; 'Solo manuale' = 'SoloManuale'; 'Aggiornato' = 'Aggiornato'; 'Non verificabile' = 'NonVerificabile' }
+    $mappaAtt   = @{ 'Con flag Attenzione' = 'Con'; 'Senza flag Attenzione' = 'Senza' }
+    $mappaTipo  = @{ 'winget' = 'winget'; 'Non verificabile (ARP)' = 'ARP'; 'MSIX' = 'MSIX' }
+
+    $par = @{ Elenco = $tutti; Testo = $Vista.Testo.Text.Trim(); Liste = $script:ListeFinestra }
+    if ($Vista.Combo['Stato']      -and $Vista.Combo['Stato'].SelectedIndex      -gt 0) { $par.Stato      = $mappaStato[[string]$Vista.Combo['Stato'].SelectedItem] }
+    if ($Vista.Combo['Attenzione'] -and $Vista.Combo['Attenzione'].SelectedIndex -gt 0) { $par.Attenzione = $mappaAtt[[string]$Vista.Combo['Attenzione'].SelectedItem] }
+    if ($Vista.Combo['Tipo']       -and $Vista.Combo['Tipo'].SelectedIndex       -gt 0) { $par.Tipo       = $mappaTipo[[string]$Vista.Combo['Tipo'].SelectedItem] }
+    if ($Vista.Combo['Lista']      -and $Vista.Combo['Lista'].SelectedIndex      -gt 0) { $par.Lista      = [string]$Vista.Combo['Lista'].SelectedItem }
+
+    $filtrati = @(Select-Programmi @par | Sort-Object -Property $Vista.Ordine.Colonna -Descending:$Vista.Ordine.Discendente)
+
+    $lv = $Vista.Lista
+    $lv.BeginUpdate()
+    $lv.Items.Clear()
+    $giallo = [Drawing.Color]::FromArgb(255, 246, 200)
+    foreach ($p in $filtrati) {
+        $valori = foreach ($c in $Vista.Colonne) { [string]$p.($c.Proprieta) }
+        $item = [Windows.Forms.ListViewItem]::new([string[]]@($valori))
+        $item.Tag = $p
+        if ($p.Attenzione) { $item.BackColor = $giallo }
+        if ($p.Stato -eq 'SoloManuale' -or $p.Escluso) { $item.ForeColor = [Drawing.Color]::Gray }
+        [void]$lv.Items.Add($item)
+    }
+    $lv.EndUpdate()
+
+    $Vista.Contatore.Text = "$($filtrati.Count) di $($tutti.Count) visualizzati   "
+}
+
+function Show-Finestra {
+    <#
+        Mostra la finestra principale. Nella tappa 5a è solo consultazione:
+        i pulsanti che modificano qualcosa sono presenti ma disattivati.
+    #>
+    param($Inventario, $Config, $Stato, $Liste, [string]$Modalita)
+
+    Initialize-Grafica
+    $script:ListeFinestra = $Liste
+
+    # Colonne "di comodo" per la visualizzazione
+    foreach ($p in $Inventario) {
+        $p | Add-Member -Force -NotePropertyMembers @{
+            StatoTesto = $script:NomiStato[$p.Stato]
+            TipoTesto  = Get-TipoLeggibile $p.Tipo
+        }
+    }
+
+    $font = New-Object Drawing.Font('Segoe UI', 9)
+    $form = New-Object Windows.Forms.Form
+    $form.Text = "Software Update Checker - $Modalita"
+    $form.Font = $font
+    $form.AutoScaleMode = 'Dpi'
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object Drawing.Size(1200, 820)
+    $form.MinimumSize = New-Object Drawing.Size(900, 600)
+
+    # --- intestazione ---
+    $info = Get-InfoControlli $Config $Stato
+    $daAgg = @($Inventario | Where-Object { $_.Destinazione })
+    $testata = New-Object Windows.Forms.Label
+    $testata.Dock = 'Top'
+    $testata.Height = 48
+    $testata.Padding = New-Object Windows.Forms.Padding(8, 6, 8, 0)
+    $testata.Font = New-Object Drawing.Font('Segoe UI', 9.5)
+    $testata.Text = ("Ultimo controllo: {0}   ·   Prossimo controllo: {1}   ·   Modalità: {2}`r`n" +
+                     "{3} programmi   ·   {4} aggiornabili   ·   {5} solo manuali   ·   {6} con attenzione   ·   {7} di sistema   ·   {8} esclusi") -f
+                     $info.Ultimo, $info.Prossimo, $Modalita, $Inventario.Count,
+                     @($daAgg | Where-Object { $_.Stato -eq 'Aggiornabile' -and $_.Destinazione -eq 'Finestra' }).Count,
+                     @($daAgg | Where-Object { $_.Stato -eq 'SoloManuale'  -and $_.Destinazione -eq 'Finestra' }).Count,
+                     @($daAgg | Where-Object { $_.Attenzione }).Count,
+                     @($daAgg | Where-Object { $_.Destinazione -eq 'Sistema' }).Count,
+                     @($daAgg | Where-Object { $_.Destinazione -eq 'Escluso' }).Count
+
+    # --- schede ---
+    $schede = New-Object Windows.Forms.TabControl
+    $schede.Dock = 'Fill'
+    $tAgg   = New-Object Windows.Forms.TabPage; $tAgg.Text   = 'Aggiornamenti'
+    $tSis   = New-Object Windows.Forms.TabPage; $tSis.Text   = 'Sistema'
+    $tListe = New-Object Windows.Forms.TabPage; $tListe.Text = 'Liste'
+    $tTutti = New-Object Windows.Forms.TabPage; $tTutti.Text = 'Tutti i programmi'
+    $schede.TabPages.AddRange(@($tAgg, $tSis, $tListe, $tTutti))
+
+    $colAgg = @(
+        @{ Titolo = 'Nome';        Proprieta = 'Nome';             Larghezza = 300 },
+        @{ Titolo = 'Installata';  Proprieta = 'Installata';       Larghezza = 150 },
+        @{ Titolo = 'Disponibile'; Proprieta = 'Disponibile';      Larghezza = 150 },
+        @{ Titolo = 'Stato';       Proprieta = 'StatoTesto';       Larghezza = 110 },
+        @{ Titolo = 'Note';        Proprieta = 'MotiviAttenzione'; Larghezza = 400 }
+    )
+    $script:InventarioFinestra = $Inventario
+
+    # Pulsanti (attivi dalle tappe 5b, 5c e 5d)
+    $suggerimento = New-Object Windows.Forms.ToolTip
+    function New-Pulsante([string]$Testo, [string]$Tappa) {
+        $b = New-Object Windows.Forms.Button
+        $b.Text = $Testo
+        $b.AutoSize = $true
+        $b.Enabled = $false
+        $suggerimento.SetToolTip($b, "Disponibile dalla tappa $Tappa")
+        return $b
+    }
+
+    # Scheda Aggiornamenti
+    $pAgg = New-Object Windows.Forms.FlowLayoutPanel
+    $pAgg.Dock = 'Bottom'; $pAgg.Height = 40; $pAgg.Padding = New-Object Windows.Forms.Padding(4)
+    $pAgg.Controls.AddRange(@(
+        (New-Pulsante 'Seleziona tutti' '5b'), (New-Pulsante 'Nessuno' '5b'),
+        (New-Pulsante '▶ Aggiorna selezionati' '5c'),
+        (New-Pulsante '+ Automatici' '5b'), (New-Pulsante '+ Esclusi' '5b'),
+        (New-Pulsante '! Segnala' '5b'), (New-Pulsante 'Rimuovi segnalazione' '5b')))
+    $cbSim = New-Object Windows.Forms.CheckBox
+    $cbSim.Text = 'Simulazione (dry-run)'; $cbSim.AutoSize = $true; $cbSim.Enabled = $false
+    $cbSim.Margin = New-Object Windows.Forms.Padding(12, 8, 0, 0)
+    $pAgg.Controls.Add($cbSim)
+    $tAgg.Controls.Add($pAgg)
+    $vAgg = New-Vista -Contenitore $tAgg -Colonne $colAgg -Filtri @('Stato', 'Attenzione') -Caselle `
+            -Fonte { $script:InventarioFinestra | Where-Object { $_.Destinazione -eq 'Finestra' } }
+
+    # Scheda Sistema
+    $vSis = New-Vista -Contenitore $tSis -Colonne $colAgg -Filtri @('Stato', 'Attenzione') -Caselle `
+            -Fonte { $script:InventarioFinestra | Where-Object { $_.Destinazione -eq 'Sistema' } }
+
+    # Scheda Tutti i programmi
+    $colTutti = @(
+        @{ Titolo = 'Nome';        Proprieta = 'Nome';             Larghezza = 280 },
+        @{ Titolo = 'Id';          Proprieta = 'Id';               Larghezza = 260 },
+        @{ Titolo = 'Tipo';        Proprieta = 'TipoTesto';        Larghezza = 150 },
+        @{ Titolo = 'Installata';  Proprieta = 'Installata';       Larghezza = 120 },
+        @{ Titolo = 'Disponibile'; Proprieta = 'Disponibile';      Larghezza = 120 },
+        @{ Titolo = 'Stato';       Proprieta = 'StatoTesto';       Larghezza = 110 },
+        @{ Titolo = 'Note';        Proprieta = 'MotiviAttenzione'; Larghezza = 300 }
+    )
+    $pTutti = New-Object Windows.Forms.FlowLayoutPanel
+    $pTutti.Dock = 'Bottom'; $pTutti.Height = 40; $pTutti.Padding = New-Object Windows.Forms.Padding(4)
+    $pTutti.Controls.AddRange(@((New-Pulsante 'Esporta vista…' '5d'), (New-Pulsante 'Esporta tutto…' '5d')))
+    $tTutti.Controls.Add($pTutti)
+    $vTutti = New-Vista -Contenitore $tTutti -Colonne $colTutti -Filtri @('Stato', 'Attenzione', 'Tipo', 'Lista') `
+              -Fonte { $script:InventarioFinestra }
+
+    # Scheda Liste: scegli la lista dalla tendina
+    $pListeSu = New-Object Windows.Forms.FlowLayoutPanel
+    $pListeSu.Dock = 'Top'; $pListeSu.Height = 34; $pListeSu.Padding = New-Object Windows.Forms.Padding(4, 4, 4, 0)
+    $lL = New-Object Windows.Forms.Label; $lL.Text = 'Lista:'; $lL.AutoSize = $true
+    $lL.Margin = New-Object Windows.Forms.Padding(0, 6, 4, 0)
+    $cbL = New-Object Windows.Forms.ComboBox; $cbL.DropDownStyle = 'DropDownList'; $cbL.Width = 260
+    [void]$cbL.Items.AddRange(@('Automatici', 'Esclusi', 'Segnalati da te (Attenzione)', 'Regole automatiche sospese'))
+    $pListeSu.Controls.AddRange(@($lL, $cbL))
+    $lvL = New-Object Windows.Forms.ListView
+    $lvL.Dock = 'Fill'; $lvL.View = 'Details'; $lvL.FullRowSelect = $true; $lvL.GridLines = $true; $lvL.CheckBoxes = $true
+    [void]$lvL.Columns.Add('Id', 320); [void]$lvL.Columns.Add('Nome', 320); [void]$lvL.Columns.Add('Installato', 100)
+    $pListeGiu = New-Object Windows.Forms.FlowLayoutPanel
+    $pListeGiu.Dock = 'Bottom'; $pListeGiu.Height = 40; $pListeGiu.Padding = New-Object Windows.Forms.Padding(4)
+    $pListeGiu.Controls.Add((New-Pulsante 'Rimuovi dalla lista' '5b'))
+    $tListe.Controls.Add($lvL); $tListe.Controls.Add($pListeSu); $tListe.Controls.Add($pListeGiu)
+
+    $cbL.Tag = $lvL
+    $cbL.Add_SelectedIndexChanged({
+        $lvL = $this.Tag
+        $chiave = @('Automatici', 'Esclusi', 'Attenzione', 'AttenzioneRimossa')[$this.SelectedIndex]
+        $lvL.BeginUpdate(); $lvL.Items.Clear()
+        foreach ($id in @($script:ListeFinestra.$chiave)) {
+            $p = $script:InventarioFinestra | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+            $nome = if ($p) { $p.Nome } else { '(non trovato tra i programmi installati)' }
+            $inst = if ($p) { 'sì' } else { 'no' }
+            [void]$lvL.Items.Add([Windows.Forms.ListViewItem]::new([string[]]@($id, $nome, $inst)))
+        }
+        $lvL.EndUpdate()
+    })
+    $cbL.SelectedIndex = 0
+
+    # --- pannello di log ---
+    $pLog = New-Object Windows.Forms.Panel
+    $pLog.Dock = 'Bottom'; $pLog.Height = 170
+    $barraLog = New-Object Windows.Forms.FlowLayoutPanel
+    $barraLog.Dock = 'Top'; $barraLog.Height = 32; $barraLog.Padding = New-Object Windows.Forms.Padding(4, 2, 4, 0)
+    $lLog = New-Object Windows.Forms.Label; $lLog.Text = 'Log'; $lLog.AutoSize = $true
+    $lLog.Font = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold)
+    $lLog.Margin = New-Object Windows.Forms.Padding(0, 6, 12, 0)
+    $bCopia = New-Object Windows.Forms.Button; $bCopia.Text = 'Copia';  $bCopia.AutoSize = $true
+    $bSalva = New-Object Windows.Forms.Button; $bSalva.Text = 'Salva…'; $bSalva.AutoSize = $true
+    $bNasc  = New-Object Windows.Forms.Button; $bNasc.Text = '▼ Nascondi'; $bNasc.AutoSize = $true
+    $barraLog.Controls.AddRange(@($lLog, $bCopia, $bSalva, $bNasc))
+
+    $script:BoxLog = New-Object Windows.Forms.RichTextBox
+    $script:BoxLog.Dock = 'Fill'
+    $script:BoxLog.ReadOnly = $true
+    $script:BoxLog.BackColor = [Drawing.Color]::FromArgb(30, 30, 30)
+    $script:BoxLog.Font = New-Object Drawing.Font('Consolas', 9)
+    $pLog.Controls.Add($script:BoxLog)
+    $pLog.Controls.Add($barraLog)
+
+    $bCopia.Add_Click({ if ($script:BoxLog.Text) { [Windows.Forms.Clipboard]::SetText($script:BoxLog.Text) } })
+    $bSalva.Add_Click({
+        $dlg = New-Object Windows.Forms.SaveFileDialog
+        $dlg.Filter = 'Testo (*.txt)|*.txt'
+        $dlg.FileName = 'Log_' + (Get-Date -Format 'yyyy-MM-dd_HHmm') + '.txt'
+        if ($dlg.ShowDialog() -eq 'OK') {
+            [IO.File]::WriteAllText($dlg.FileName, $script:BoxLog.Text, (New-Object Text.UTF8Encoding($true)))
+        }
+    })
+    $bNasc.Tag = $pLog
+    $bNasc.Add_Click({
+        $pannello = $this.Tag
+        if ($pannello.Height -gt 40) { $pannello.Height = 32; $this.Text = '▲ Mostra' }
+        else { $pannello.Height = 170; $this.Text = '▼ Nascondi' }
+    })
+
+    # Ordine di aggiunta: prima ciò che riempie (Fill), poi i bordi
+    $form.Controls.Add($schede)
+    $form.Controls.Add($pLog)
+    $form.Controls.Add($testata)
+
+    # Le righe di log scritte prima che la finestra esistesse
+    foreach ($r in $script:LogSessione) { Add-LogFinestra $r.Riga $r.Livello }
+
+    foreach ($v in @($vAgg, $vSis, $vTutti)) { Update-Vista $v }
+
+    # Se c'è qualcosa da decidere si parte dalla scheda Aggiornamenti, altrimenti da Tutti
+    if ($vAgg.Lista.Items.Count -eq 0) { $schede.SelectedTab = $tTutti }
+
+    $form.Add_Shown({ $this.TopMost = $true; $this.Activate(); $this.TopMost = $false })
+    Write-Log "Finestra aperta ($Modalita)."
+    [void]$form.ShowDialog()
+    $script:BoxLog = $null
+    $form.Dispose()
+    Write-Log 'Finestra chiusa.'
+}
+
+# ---------------------------------------------------------------
 #  PROGRAMMA PRINCIPALE
 # ---------------------------------------------------------------
 try {
@@ -837,7 +1331,15 @@ try {
     $stato = Initialize-Stato (Read-Json $FileStato)
     $liste = Read-Liste
 
-    if (-not (Test-DeveEseguire $config $stato)) { return }
+    if ($Info) {
+        $script:MotivoEsecuzione = 'consultazione (Info)'
+        Write-Log 'Modalità Info: sola consultazione.'
+    }
+    elseif (-not (Test-DeveEseguire $config $stato)) { return }
+
+    # In modalità Info (avviata dal menu, senza console) mostriamo un "Caricamento..."
+    $attesa = $null
+    if ($Info) { $attesa = Show-Attesa 'Lettura dei programmi installati in corso...' }
 
     Import-Module Microsoft.WinGet.Client
 
@@ -856,6 +1358,13 @@ try {
     Set-Classificazione -Inventario $inventario -Config $config -Liste $liste -Stato $stato
     if ($Test -or $Dettagli) { Show-RiepilogoTest $inventario }
 
+    # --- Modalità Info: solo la finestra, poi si esce senza toccare nulla ---
+    if ($Info) {
+        if ($attesa) { $attesa.Close(); $attesa.Dispose() }
+        Show-Finestra -Inventario $inventario -Config $config -Stato $stato -Liste $liste -Modalita 'Info (sola consultazione)'
+        return
+    }
+
     # --- Fase 3: aggiornamenti automatici ---
     $automatici    = @($inventario | Where-Object { $_.Destinazione -eq 'Automatico' })
     $risultatiAuto = @()
@@ -868,8 +1377,16 @@ try {
         Write-Log 'Nessun aggiornamento automatico da eseguire.'
     }
 
-    # --- Fase 4: report e memoria ---
     Update-InventarioDopoAggiornamenti -Inventario $inventario -Risultati $risultatiAuto
+
+    # --- Fase 5: la finestra, solo se resta qualcosa da decidere ---
+    $daDecidere = @($inventario | Where-Object { $_.Destinazione -eq 'Finestra' })
+    if ($daDecidere.Count -gt 0) {
+        $modo = if ($Test) { 'Simulazione' } else { 'Controllo' }
+        Show-Finestra -Inventario $inventario -Config $config -Stato $stato -Liste $liste -Modalita $modo
+    }
+
+    # --- Fase 4: report e memoria ---
     $blocco = New-BloccoReport -Inventario $inventario -Stato $stato -RisultatiAuto $risultatiAuto
     Write-Report -Inventario $inventario -Blocco $blocco -Cartella $cartellaReport
 
