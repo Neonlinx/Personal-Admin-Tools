@@ -100,11 +100,11 @@ menu(type='desktop' where=path.exists(suc_script)
          cmd='powershell.exe'
          args='-NoProfile -NoExit -File "@suc_script" -Forza -Dettagli')
 
-    // Attivata nella FASE 5 (finestra grafica): il parametro -Info ancora non esiste
-    // item(title='Situazione attuale (Info)'
-    //      image=icon.details
-    //      cmd='powershell.exe'
-    //      args='-NoProfile -WindowStyle Hidden -File "@suc_script" -Info')
+    // Finestra in sola consultazione (attivata con la fase 5a)
+    item(title='Situazione attuale (Info)'
+         image=icon.details
+         cmd='powershell.exe'
+         args='-NoProfile -WindowStyle Hidden -File "@suc_script" -Info')
 
     separator
 
