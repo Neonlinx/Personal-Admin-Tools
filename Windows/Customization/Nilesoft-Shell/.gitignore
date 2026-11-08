@@ -1,0 +1,10 @@
+# Regole valide solo per questa cartella (si aggiungono a quelle del repository)
+
+# Backup locali creati da Deploy-NilesoftConfig.ps1
+_backup/
+
+# Copie di sicurezza manuali (.bak, .bak2, ...)
+*.bak*
+
+# Log di Nilesoft
+shell.log

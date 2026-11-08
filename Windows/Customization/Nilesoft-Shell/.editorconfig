@@ -1,0 +1,19 @@
+# Regole SOLO per questa cartella: si aggiungono a quelle del .editorconfig
+# principale di Personal-Admin-Tools (per questo NON c'è "root = true").
+
+# Nilesoft: UN SOLO BOM. Non tocchiamo rientri e spazi per non creare differenze inutili.
+[*.nss]
+charset = utf-8-bom
+end_of_line = crlf
+
+# PowerShell 5.1 legge correttamente gli accenti solo con il BOM
+[*.ps1]
+charset = utf-8-bom
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+
+[*.md]
+charset = utf-8
+end_of_line = lf
