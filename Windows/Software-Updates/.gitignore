@@ -1,0 +1,6 @@
+   # Software-Updates: file locali da non pubblicare (il repo è PUBBLICO)
+   *.bak
+   *.precedente
+   *.tmp
+   # Copie di lavoro numerate (le versioni vere sono nella cronologia di git)
+   Software-Update-Checker_*.ps1
