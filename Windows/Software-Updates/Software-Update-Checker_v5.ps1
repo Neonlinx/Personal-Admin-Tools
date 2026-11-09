@@ -42,6 +42,10 @@ $script:MotivoEsecuzione = ''
 $script:LogSessione = New-Object System.Collections.Generic.List[object]
 $script:BoxLog = $null
 
+# Esiti degli aggiornamenti lanciati dalla finestra (finiscono nel report)
+$script:RisultatiFinestra = New-Object System.Collections.Generic.List[object]
+$script:AggiornamentoInCorso = $false
+
 # ---------------------------------------------------------------
 #  FUNZIONI DI SUPPORTO
 # ---------------------------------------------------------------
@@ -408,7 +412,7 @@ function New-PuntoRipristino {
 
 function Invoke-Aggiornamento {
     <# Aggiorna UN programma e restituisce l'esito #>
-    param($Pacchetto, [int]$TimeoutMinuti = 15)
+    param($Pacchetto, [int]$TimeoutMinuti = 15, [switch]$Simula)
 
     $argomenti = @('upgrade', '--id', $Pacchetto.Id, '--exact', '--silent',
                    '--accept-package-agreements', '--accept-source-agreements',
@@ -426,7 +430,7 @@ function Invoke-Aggiornamento {
     }
 
     # In simulazione ci limitiamo a dire cosa faremmo
-    if ($Test) {
+    if ($Test -or $Simula) {
         $risultato.Esito     = 'Simulato'
         $risultato.Messaggio = "winget $($argomenti -join ' ')"
         return $risultato
@@ -441,13 +445,20 @@ function Invoke-Aggiornamento {
                                   -RedirectStandardOutput $fileOutput -RedirectStandardError $fileErrori
         $null = $processo.Handle   # trucco tecnico: serve per poter leggere il codice di uscita alla fine
 
-        # Attesa con limite di tempo (il valore è in millisecondi)
-        if (-not $processo.WaitForExit($TimeoutMinuti * 60 * 1000)) {
-            & taskkill.exe /PID $processo.Id /T /F | Out-Null
-            $risultato.Esito     = 'Fallito'
-            $risultato.Messaggio = "Interrotto: superato il limite di $TimeoutMinuti minuti"
-            return $risultato
+        # Attesa con limite di tempo. Controlliamo ogni 200 ms invece di "bloccarci":
+        # così, se la finestra è aperta, resta reattiva (log e barra si aggiornano)
+        $limite = (Get-Date).AddMinutes($TimeoutMinuti)
+        while (-not $processo.HasExited) {
+            if ((Get-Date) -gt $limite) {
+                & taskkill.exe /PID $processo.Id /T /F | Out-Null
+                $risultato.Esito     = 'Fallito'
+                $risultato.Messaggio = "Interrotto: superato il limite di $TimeoutMinuti minuti"
+                return $risultato
+            }
+            if ($script:GraficaPronta) { [Windows.Forms.Application]::DoEvents() }
+            Start-Sleep -Milliseconds 200
         }
+        $processo.WaitForExit()   # garantisce che il codice di uscita sia disponibile
 
         $codice = $processo.ExitCode
         $ultimaRiga = Get-Content -LiteralPath $fileOutput -Encoding UTF8 -ErrorAction SilentlyContinue |
@@ -488,21 +499,30 @@ function Invoke-Aggiornamento {
 }
 
 function Invoke-Aggiornamenti {
-    <# Aggiorna un ELENCO di programmi: punto di ripristino, ordine, storico fallimenti #>
-    param($Pacchetti, $Stato)
+    <#
+        Aggiorna un ELENCO di programmi: punto di ripristino, ordine, storico fallimenti.
+        -Simula      : nessuna installazione (dry-run)
+        -Avanzamento : blocco di codice chiamato prima e dopo ogni programma (per la finestra)
+    #>
+    param($Pacchetti, $Stato, [switch]$Simula, [scriptblock]$Avanzamento)
 
     # Ordine: tutti in ordine alfabetico, App Installer (winget stesso) sempre per ultimo
     $ordinati = @($Pacchetti | Sort-Object @{ Expression = { $_.Id -eq 'Microsoft.AppInstaller' } }, Nome)
 
-    if (-not $Test) {
+    if (-not ($Test -or $Simula)) {
         if (-not (Test-Amministratore)) {
             Write-Log 'Lo script non ha i permessi di amministratore: alcuni aggiornamenti potrebbero fallire.' 'AVVISO'
         }
         New-PuntoRipristino
     }
 
+    $totale = $ordinati.Count
+    $n = 0
     $risultati = foreach ($p in $ordinati) {
-        $r = Invoke-Aggiornamento -Pacchetto $p
+        $n++
+        if ($Avanzamento) { & $Avanzamento $n $totale $p $null }
+
+        $r = Invoke-Aggiornamento -Pacchetto $p -Simula:$Simula
 
         if ($r.Esito -eq 'OK') {
             $Stato.Fallimenti.PSObject.Properties.Remove($p.Id)
@@ -516,7 +536,12 @@ function Invoke-Aggiornamenti {
             })
             Write-Log "FALLITO: $($p.Nome) - $($r.Messaggio) [$($r.Codice)]" 'AVVISO'
         }
+        elseif ($r.Esito -eq 'Simulato') {
+            Write-Log "Simulato: $($p.Nome) ($($r.Da) -> $($r.A)) - $($r.Messaggio)"
+        }
+        if ($r.Riavvio) { Write-Log "Riavvio consigliato per: $($p.Nome)" 'AVVISO' }
 
+        if ($Avanzamento) { & $Avanzamento $n $totale $p $r }
         $r   # "consegna" il risultato all'elenco $risultati
     }
 
@@ -648,7 +673,7 @@ function New-InventarioMensile {
 
 function New-BloccoReport {
     <# Costruisce, riga per riga, il blocco di testo di questo controllo #>
-    param($Inventario, $Stato, $RisultatiAuto)
+    param($Inventario, $Stato, $RisultatiAuto, $RisultatiFinestra = @())
 
     $cultura   = [Globalization.CultureInfo]'it-IT'
     $r         = New-Object System.Collections.Generic.List[string]
@@ -662,7 +687,9 @@ function New-BloccoReport {
     $sistema      = @($daAggiornare | Where-Object { $_.Destinazione -eq 'Sistema' } | Sort-Object Nome)
     $autoOk       = @($RisultatiAuto | Where-Object { $_.Esito -eq 'OK' })
     $autoKo       = @($RisultatiAuto | Where-Object { $_.Esito -eq 'Fallito' })
-    $riavvio      = @($RisultatiAuto | Where-Object { $_.Riavvio })
+    $finOk        = @($RisultatiFinestra | Where-Object { $_.Esito -eq 'OK' })
+    $finKo        = @($RisultatiFinestra | Where-Object { $_.Esito -eq 'Fallito' })
+    $riavvio      = @(@($RisultatiAuto) + @($RisultatiFinestra) | Where-Object { $_ -and $_.Riavvio })
     $riconosciuti = @($Inventario | Where-Object { $_.Tipo -notin 'MSIX','ARP','Altro' }).Count
 
     # --- Intestazione ---
@@ -690,6 +717,7 @@ function New-BloccoReport {
         'Esclusi'                    = $esclusi.Count
         'Componenti di sistema'      = $sistema.Count
         'Aggiornati in automatico'   = "$(@($RisultatiAuto).Count)  (riusciti: $($autoOk.Count), falliti: $($autoKo.Count))"
+        'Aggiornati dalla finestra'  = "$(@($RisultatiFinestra).Count)  (riusciti: $($finOk.Count), falliti: $($finKo.Count))"
     }
     $r.Add('')
     $r.Add(' RIEPILOGO')
@@ -721,6 +749,18 @@ function New-BloccoReport {
         $r.Add('')
         $r.Add(' AGGIORNAMENTI AUTOMATICI ESEGUITI')
         foreach ($x in @($RisultatiAuto | Sort-Object Nome)) {
+            $etichetta = switch ($x.Esito) { 'OK' {'[OK]     '} 'Fallito' {'[FALLITO]'} default {"[$($x.Esito)]"} }
+            $riga = '   {0} {1} {2} -> {3}' -f $etichetta, (Format-Cella $x.Nome 40), $x.Da, $x.A
+            if ($x.Esito -eq 'Fallito') { $riga += "   ($($x.Messaggio) $($x.Codice))".Replace(' )', ')') }
+            $r.Add($riga.TrimEnd())
+        }
+    }
+
+    # --- Aggiornamenti eseguiti dalla finestra ---
+    if (@($RisultatiFinestra).Count -gt 0) {
+        $r.Add('')
+        $r.Add(' AGGIORNAMENTI ESEGUITI DALLA FINESTRA')
+        foreach ($x in @($RisultatiFinestra | Sort-Object Nome)) {
             $etichetta = switch ($x.Esito) { 'OK' {'[OK]     '} 'Fallito' {'[FALLITO]'} default {"[$($x.Esito)]"} }
             $riga = '   {0} {1} {2} -> {3}' -f $etichetta, (Format-Cella $x.Nome 40), $x.Da, $x.A
             if ($x.Esito -eq 'Fallito') { $riga += "   ($($x.Messaggio) $($x.Codice))".Replace(' )', ')') }
@@ -808,6 +848,10 @@ function Save-Stato {
             [pscustomobject]@{ Id = $_.Id; Nome = $_.Nome; Versione = $_.Installata; Tipo = $_.Tipo }
         })
     }
+    # Preferenze di esportazione (ultima cartella e formato), se presenti
+    if ($Stato.PSObject.Properties['Esportazione']) {
+        $daSalvare | Add-Member -NotePropertyName Esportazione -NotePropertyValue $Stato.Esportazione
+    }
 
     $json        = $daSalvare | ConvertTo-Json -Depth 5
     $temporaneo  = "$FileStato.tmp"
@@ -818,7 +862,7 @@ function Save-Stato {
 }
 
 # ---------------------------------------------------------------
-#  FASE 5 - FINESTRA (5a: visualizzazione, filtri, log - 5b: gestione liste)
+#  FASE 5 - FINESTRA (5a: visualizzazione e filtri - 5b: liste - 5c: aggiornamento - 5d: esportazione)
 # ---------------------------------------------------------------
 
 # Testi "umani" per stati e tipi
@@ -1189,9 +1233,10 @@ function Save-Liste {
 function New-PannelloAzioni {
     <#
         Crea la fila di pulsanti in fondo a una scheda.
-        I pulsanti delle liste sono attivi (tappa 5b); Aggiorna (5c) ed Esporta (5d) ancora no.
+        Liste (5b), Aggiorna (5c) ed Esporta (5d).
+        In modalità Info il pulsante Aggiorna resta spento: Info non installa mai nulla.
     #>
-    param([Windows.Forms.Control]$Contenitore, [switch]$ConAggiorna, [switch]$ConEsporta)
+    param([Windows.Forms.Control]$Contenitore, [switch]$ConAggiorna)
 
     $pannello = New-Object Windows.Forms.FlowLayoutPanel
     $pannello.Dock = 'Bottom'
@@ -1211,9 +1256,10 @@ function New-PannelloAzioni {
     }
 
     Add-Pulsante 'Seleziona tutti' 'SelezionaTutti' 'Spunta tutti i programmi visualizzati'
-    Add-Pulsante 'Nessuno'         'Nessuno'        'Toglie tutte le spunte'
+    Add-Pulsante 'Deseleziona tutti' 'Nessuno'      'Toglie tutte le spunte'
     if ($ConAggiorna) {
-        Add-Pulsante '▶ Aggiorna selezionati' 'Aggiorna' 'Disponibile dalla tappa 5c' $false
+        if ($Info) { Add-Pulsante '▶ Aggiorna selezionati' 'Aggiorna' 'Non disponibile in modalità Info (sola consultazione)' $false }
+        else       { Add-Pulsante '▶ Aggiorna selezionati' 'Aggiorna' 'Aggiorna i programmi spuntati (prima chiede conferma)' }
     }
     Add-Pulsante '+ Automatici'          'Automatici'          'Aggiorna da solo, il sabato, i programmi spuntati'
     Add-Pulsante '+ Esclusi'             'Esclusi'             'Ignora per sempre i programmi spuntati'
@@ -1222,15 +1268,15 @@ function New-PannelloAzioni {
 
     if ($ConAggiorna) {
         $cb = New-Object Windows.Forms.CheckBox
-        $cb.Text = 'Simulazione (dry-run)'; $cb.AutoSize = $true; $cb.Enabled = $false
+        $cb.Text = 'Simulazione (dry-run)'; $cb.AutoSize = $true; $cb.Name = 'Simulazione'
         $cb.Margin = New-Object Windows.Forms.Padding(12, 8, 0, 0)
-        $script:Suggerimenti.SetToolTip($cb, 'Disponibile dalla tappa 5c')
+        if ($Test) { $cb.Checked = $true; $cb.Enabled = $false }      # in -Test si simula sempre
+        if ($Info) { $cb.Enabled = $false }
+        $script:Suggerimenti.SetToolTip($cb, 'Fa tutto il percorso ma non installa nulla: mostra i comandi che verrebbero eseguiti')
         $pannello.Controls.Add($cb)
+        $pulsanti.Add($cb)
     }
-    if ($ConEsporta) {
-        Add-Pulsante 'Esporta vista…' 'EsportaVista' 'Disponibile dalla tappa 5d' $false
-        Add-Pulsante 'Esporta tutto…' 'EsportaTutto' 'Disponibile dalla tappa 5d' $false
-    }
+    Add-Pulsante 'Esporta…' 'Esporta' 'Salva in CSV (Excel) o TXT la vista attuale, con i filtri, oppure l''inventario completo'
 
     $Contenitore.Controls.Add($pannello)
     return $pulsanti
@@ -1240,8 +1286,12 @@ function Connect-Azioni {
     <# Collega i pulsanti di un pannello alla vista (elenco) della stessa scheda #>
     param($Pulsanti, $Vista)
     foreach ($b in $Pulsanti) {
+        if ($b -is [Windows.Forms.CheckBox]) {
+            $Vista | Add-Member -Force -NotePropertyName Simulazione -NotePropertyValue $b
+            continue
+        }
         $b.Tag = $Vista
-        $b.Add_Click({ Invoke-AzioneFinestra -Vista $this.Tag -Azione $this.Name })
+        $b.Add_Click({ Invoke-AzioneFinestra -Vista $this.Tag -Azione $this.Name -Pulsante $this })
     }
 }
 
@@ -1254,13 +1304,15 @@ function Get-ProgrammiScelti {
 }
 
 function Invoke-AzioneFinestra {
-    <# Esegue l'azione di un pulsante: selezione oppure modifica delle liste #>
-    param($Vista, [string]$Azione)
+    <# Esegue l'azione di un pulsante: selezione, aggiornamento, esportazione o modifica delle liste #>
+    param($Vista, [string]$Azione, $Pulsante)
 
     $lv = $Vista.Lista
     switch ($Azione) {
         'SelezionaTutti' { foreach ($i in $lv.Items) { $i.Checked = $true }; return }
         'Nessuno'        { foreach ($i in $lv.Items) { $i.Checked = $false }; return }
+        'Aggiorna'       { Invoke-AggiornaFinestra -Vista $Vista; return }
+        'Esporta'        { Show-MenuEsporta -Vista $Vista -Pulsante $Pulsante; return }
     }
 
     $scelti = @(Get-ProgrammiScelti $lv)
@@ -1272,12 +1324,331 @@ function Invoke-AzioneFinestra {
     Invoke-ModificaListe -Programmi $scelti -Azione $Azione
 }
 
+function Invoke-AggiornaFinestra {
+    <# Il pulsante "Aggiorna selezionati": conferma, aggiornamento con avanzamento, riepilogo #>
+    param($Vista)
+
+    $titolo = 'Software Update Checker'
+    $scelti = @(Get-ProgrammiScelti $Vista.Lista)
+    if ($scelti.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show('Spunta (o seleziona) almeno un programma.', $titolo,
+            [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+
+    $simula = $Test -or ($Vista.Simulazione -and $Vista.Simulazione.Checked)
+
+    # Solo i programmi che winget sa aggiornare; gli altri vengono saltati con una spiegazione
+    $daFare  = @($scelti | Where-Object { $_.Stato -eq 'Aggiornabile' })
+    $saltati = @($scelti | Where-Object { $_.Stato -ne 'Aggiornabile' } | Sort-Object Nome)
+    $motivoSalto = @{
+        'SoloManuale'     = 'aggiornamento manuale: dal sito o dal programma stesso'
+        'NonVerificabile' = 'non riconosciuto da winget'
+        'Aggiornato'      = 'già aggiornato'
+    }
+    $righeSaltati = @($saltati | ForEach-Object { "   • $($_.Nome)  ($($motivoSalto[$_.Stato]))" })
+    foreach ($p in $saltati) {
+        Write-Log "$($p.Nome) saltato: $($motivoSalto[$p.Stato])" 'AVVISO'
+    }
+    if ($daFare.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show("Nessuno dei programmi scelti può essere aggiornato da winget:`r`n`r`n" +
+            ($righeSaltati -join "`r`n"), $titolo, [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning)
+        return
+    }
+
+    # --- conferma ---
+    $righe = New-Object System.Collections.Generic.List[string]
+    $mostrati = 0
+    foreach ($p in ($daFare | Sort-Object Nome)) {
+        if ($mostrati -ge 20) { $righe.Add("   … e altri $($daFare.Count - 20)"); break }
+        $riga = "   • $($p.Nome)   $($p.Installata) → $($p.Disponibile)"
+        if ($p.Attenzione) { $riga += "`r`n        ⚠ $($p.MotiviAttenzione)" }
+        $righe.Add($riga)
+        $mostrati++
+    }
+    $testo = "Stai per aggiornare $($daFare.Count) programmi:`r`n`r`n" + ($righe -join "`r`n")
+    if ($saltati.Count) {
+        $testo += "`r`n`r`nATTENZIONE: i seguenti programmi NON verranno aggiornati:`r`n" + ($righeSaltati -join "`r`n")
+    }
+    $testo += "`r`n`r`nChiudi i programmi che stai per aggiornare prima di continuare."
+    if ($simula) {
+        $testo += "`r`n`r`nSIMULAZIONE: non verrà installato nulla."
+    }
+    else {
+        $testo += "`r`nPrima verrà creato un punto di ripristino (può richiedere fino a un minuto: la finestra potrebbe sembrare ferma)."
+        if (-not (Test-Amministratore)) {
+            $testo += "`r`n`r`nATTENZIONE: lo script NON è avviato come amministratore: molti aggiornamenti potrebbero fallire."
+        }
+    }
+    $testo += "`r`n`r`nContinuare?"
+    $risposta = [Windows.Forms.MessageBox]::Show($testo, $titolo, [Windows.Forms.MessageBoxButtons]::YesNo,
+                                                 [Windows.Forms.MessageBoxIcon]::Question)
+    if ($risposta -ne [Windows.Forms.DialogResult]::Yes) { Write-Log 'Aggiornamento annullato.'; return }
+
+    # --- esecuzione ---
+    $script:AggiornamentoInCorso = $true
+    $script:SchedeFinestra.Enabled = $false
+    $script:PannelloStato.Visible = $true
+    $script:BarraAvanzamento.Maximum = $daFare.Count
+    $script:BarraAvanzamento.Value = 0
+    $script:EtichettaStato.Text = if ($simula) { 'Simulazione in corso…' } else { 'Creazione del punto di ripristino…' }
+    [Windows.Forms.Application]::DoEvents()
+
+    $avanzamento = {
+        param($i, $tot, $p, $r)
+        if ($null -eq $r) {
+            $script:EtichettaStato.Text = "[$i/$tot]  $($p.Nome)  ($($p.Installata) → $($p.Disponibile))…"
+        }
+        else {
+            $script:BarraAvanzamento.Value = $i
+            $script:EtichettaStato.Text = "[$i/$tot]  $($p.Nome): $($r.Esito)"
+        }
+        [Windows.Forms.Application]::DoEvents()
+    }
+
+    $risultati = @()
+    try {
+        $risultati = @(Invoke-Aggiornamenti -Pacchetti $daFare -Stato $script:StatoFinestra -Simula:$simula -Avanzamento $avanzamento)
+    }
+    catch {
+        Write-Log "Errore durante gli aggiornamenti: $($_.Exception.Message)" 'ERRORE'
+    }
+    finally {
+        $script:AggiornamentoInCorso = $false
+        $script:SchedeFinestra.Enabled = $true
+    }
+
+    # --- dopo: inventario, classificazione, finestra ---
+    $ok      = @($risultati | Where-Object { $_.Esito -eq 'OK' })
+    $ko      = @($risultati | Where-Object { $_.Esito -eq 'Fallito' })
+    $sim     = @($risultati | Where-Object { $_.Esito -eq 'Simulato' })
+    $riavvio = @($risultati | Where-Object { $_.Riavvio })
+
+    if (-not $simula) {
+        foreach ($r in $risultati) { $script:RisultatiFinestra.Add($r) }
+        Update-InventarioDopoAggiornamenti -Inventario $script:InventarioFinestra -Risultati $risultati
+        Set-Classificazione -Inventario $script:InventarioFinestra -Config $script:ConfigFinestra `
+                            -Liste $script:ListeFinestra -Stato $script:StatoFinestra
+        Update-Finestra
+    }
+
+    $riepilogo = if ($simula) { "Simulazione completata: $($sim.Count) programmi (nessuna installazione)." }
+                 else { "Aggiornamento completato.`r`n`r`nRiusciti: $($ok.Count)`r`nFalliti: $($ko.Count)" }
+    if ($ko.Count) { $riepilogo += "`r`n`r`nFalliti:`r`n" + (($ko | ForEach-Object { "   • $($_.Nome): $($_.Messaggio)" }) -join "`r`n") }
+    if ($riavvio.Count) { $riepilogo += "`r`n`r`nRiavvio consigliato per: " + (($riavvio | ForEach-Object { $_.Nome }) -join ', ') }
+    $script:EtichettaStato.Text = ($riepilogo -split "`r`n")[0]
+    Write-Log ($riepilogo -replace "`r`n", ' ')
+
+    $icona = if ($ko.Count) { [Windows.Forms.MessageBoxIcon]::Warning } else { [Windows.Forms.MessageBoxIcon]::Information }
+    [void][Windows.Forms.MessageBox]::Show($riepilogo, $titolo, [Windows.Forms.MessageBoxButtons]::OK, $icona)
+}
+
+function Get-RigheEsportazione {
+    <#
+        Prepara le righe da esportare (oggetti "piatti", con nomi di colonna in italiano).
+        -Programmi : l'elenco da esportare (vista filtrata oppure inventario completo)
+        -Colonne   : le colonne della vista; se omesse, si esporta TUTTO (inventario completo)
+    #>
+    param($Programmi, $Colonne, $Liste, $Stato)
+
+    $segnalati = @($Liste.Attenzione)
+    $fallimenti = $null
+    if ($Stato -and $Stato.Fallimenti) { $fallimenti = $Stato.Fallimenti }
+
+    foreach ($p in @($Programmi)) {
+        $riga = [ordered]@{}
+        if ($Colonne) {
+            foreach ($c in $Colonne) { $riga[$c.Titolo] = [string]$p.($c.Proprieta) }
+            if (-not $riga.Contains('Id')) { $riga['Id'] = [string]$p.Id }   # l'Id è sempre utile (es. per liste.json)
+        }
+        else {
+            $ultimoFallimento = ''
+            if ($fallimenti -and $fallimenti.PSObject.Properties[$p.Id]) {
+                $f = $fallimenti.PSObject.Properties[$p.Id].Value
+                $ultimoFallimento = "$($f.Data) $($f.Messaggio)".Trim()
+            }
+            $riga['Nome']              = [string]$p.Nome
+            $riga['Id']                = [string]$p.Id
+            $riga['Tipo']              = Get-TipoLeggibile $p.Tipo
+            $riga['Installata']        = [string]$p.Installata
+            $riga['Disponibile']       = [string]$p.Disponibile
+            $riga['Stato']             = $script:NomiStato[$p.Stato]
+            $riga['Destinazione']      = [string]$p.Destinazione
+            $riga['Sistema']           = if ($p.Sistema) { 'sì' } else { '' }
+            $riga['Automatico']        = if ($p.Automatico) { 'sì' } else { '' }
+            $riga['Escluso']           = if ($p.Escluso) { 'sì' } else { '' }
+            $riga['Segnalato']         = if ($segnalati -contains $p.Id) { 'sì' } else { '' }
+            $riga['Note']              = [string]$p.MotiviAttenzione
+            $riga['Ultimo fallimento'] = $ultimoFallimento
+        }
+        [pscustomobject]$riga
+    }
+}
+
+function Export-Righe {
+    <# Scrive le righe in CSV (per Excel) o in TXT (colonne allineate, come il report) #>
+    param($Righe, [string]$Percorso, [ValidateSet('CSV', 'TXT')][string]$Formato, [string]$Titolo, [string]$Descrizione)
+
+    $Righe = @($Righe)
+    $codifica = New-Object System.Text.UTF8Encoding($true)
+
+    if ($Formato -eq 'CSV') {
+        # Punto e virgola: è il separatore che Excel in italiano si aspetta
+        $testo = ($Righe | ConvertTo-Csv -Delimiter ';' -NoTypeInformation) -join "`r`n"
+        [IO.File]::WriteAllText($Percorso, $testo + "`r`n", $codifica)
+        return
+    }
+
+    $colonne = @()
+    if ($Righe.Count) { $colonne = @($Righe[0].PSObject.Properties.Name) }
+
+    # Larghezza di ogni colonna = il testo più lungo (al massimo 60 caratteri)
+    $larghezze = @{}
+    foreach ($c in $colonne) {
+        $max = $c.Length
+        foreach ($r in $Righe) { $l = ([string]$r.$c).Length; if ($l -gt $max) { $max = $l } }
+        $larghezze[$c] = [Math]::Min($max, 60)
+    }
+
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add('=' * 100)
+    $out.Add(" $Titolo")
+    $out.Add(" Creato il $(Get-Date -Format 'dd/MM/yyyy HH:mm')   ·   $($Righe.Count) programmi")
+    if ($Descrizione) { $out.Add(" $Descrizione") }
+    $out.Add('=' * 100)
+    $out.Add('')
+    $out.Add(('  ' + (($colonne | ForEach-Object { Format-Cella $_ $larghezze[$_] }) -join '  ')).TrimEnd())
+    $out.Add(('  ' + (($colonne | ForEach-Object { '-' * $larghezze[$_] }) -join '  ')).TrimEnd())
+    foreach ($r in $Righe) {
+        $out.Add(('  ' + (($colonne | ForEach-Object { Format-Cella ([string]$r.$_) $larghezze[$_] }) -join '  ')).TrimEnd())
+    }
+    [IO.File]::WriteAllText($Percorso, (($out -join "`r`n") + "`r`n"), $codifica)
+}
+
+function Get-DescrizioneFiltri {
+    <# Testo che riassume i filtri attivi di una vista, per l'intestazione del TXT #>
+    param($Vista)
+    $parti = @()
+    if ($Vista.Testo.Text.Trim()) { $parti += "Cerca: '$($Vista.Testo.Text.Trim())'" }
+    foreach ($nome in $Vista.Combo.Keys) {
+        $cb = $Vista.Combo[$nome]
+        if ($cb.SelectedIndex -gt 0) { $parti += "$($nome): $($cb.SelectedItem)" }
+    }
+    if ($parti.Count -eq 0) { return 'Filtri: nessuno' }
+    return 'Filtri: ' + ($parti -join '   ·   ')
+}
+
+function Show-MenuEsporta {
+    <# Il pulsante "Esporta…" apre un piccolo menu: vista attuale oppure inventario completo #>
+    param($Vista, $Pulsante)
+
+    $menu = New-Object Windows.Forms.ContextMenuStrip
+    $voceVista = $menu.Items.Add("Vista attuale ($($Vista.Lista.Items.Count) righe, con i filtri)…")
+    $voceTutto = $menu.Items.Add("Inventario completo ($(@($script:InventarioFinestra).Count) programmi, tutte le colonne)…")
+    $voceVista.Tag = $Vista
+    $voceTutto.Tag = $Vista
+    $voceVista.Add_Click({ Invoke-Esporta -Vista $this.Tag -Modo 'Vista' })
+    $voceTutto.Add_Click({ Invoke-Esporta -Vista $this.Tag -Modo 'Tutto' })
+    $menu.Show($Pulsante, 0, $Pulsante.Height)
+}
+
+function Invoke-Esporta {
+    <# Chiede dove e in che formato salvare, poi esporta #>
+    param($Vista, [ValidateSet('Vista', 'Tutto')][string]$Modo)
+
+    # Preferenze ricordate (ultima cartella e ultimo formato usati)
+    $pref = $null
+    if ($script:StatoFinestra -and $script:StatoFinestra.PSObject.Properties['Esportazione']) { $pref = $script:StatoFinestra.Esportazione }
+    $cartella = $script:ConfigFinestra.CartellaReport
+    if ($pref -and $pref.Cartella -and (Test-Path -LiteralPath $pref.Cartella)) { $cartella = $pref.Cartella }
+    $formatoPreferito = if ($pref -and $pref.Formato -eq 'TXT') { 'TXT' } else { 'CSV' }
+
+    $nomeScheda = $Vista.Lista.Parent.Text
+    $dlg = New-Object Windows.Forms.SaveFileDialog
+    $dlg.Title = 'Esporta elenco programmi'
+    $dlg.Filter = 'CSV per Excel (*.csv)|*.csv|Testo leggibile (*.txt)|*.txt'
+    $dlg.FilterIndex = if ($formatoPreferito -eq 'TXT') { 2 } else { 1 }
+    $dlg.InitialDirectory = $cartella
+    $base = if ($Modo -eq 'Tutto') { 'Inventario_completo' } else { 'Esportazione_' + ($nomeScheda -replace '[^\w]+', '_') }
+    $dlg.FileName = "{0}_{1}" -f $base, (Get-Date -Format 'yyyy-MM-dd_HHmm')
+    if ($dlg.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
+
+    $formato = if ($dlg.FilterIndex -eq 2 -or $dlg.FileName -like '*.txt') { 'TXT' } else { 'CSV' }
+
+    if ($Modo -eq 'Tutto') {
+        $programmi = @($script:InventarioFinestra | Sort-Object Nome)
+        $righe = Get-RigheEsportazione -Programmi $programmi -Liste $script:ListeFinestra -Stato $script:StatoFinestra
+        $titolo = 'SOFTWARE UPDATE CHECKER - INVENTARIO COMPLETO'
+        $descr = 'Tutti i programmi, tutte le colonne'
+    }
+    else {
+        # Esattamente ciò che si vede: stesse righe, stesso ordine
+        $programmi = @($Vista.Lista.Items | ForEach-Object { $_.Tag })
+        $righe = Get-RigheEsportazione -Programmi $programmi -Colonne $Vista.Colonne -Liste $script:ListeFinestra -Stato $script:StatoFinestra
+        $titolo = "SOFTWARE UPDATE CHECKER - SCHEDA '$($nomeScheda.ToUpper())'"
+        $descr = Get-DescrizioneFiltri $Vista
+    }
+
+    try {
+        Export-Righe -Righe $righe -Percorso $dlg.FileName -Formato $formato -Titolo $titolo -Descrizione $descr
+        Write-Log "Esportati $(@($righe).Count) programmi ($formato): $($dlg.FileName)"
+    }
+    catch {
+        Write-Log "Esportazione non riuscita: $($_.Exception.Message)" 'ERRORE'
+        [void][Windows.Forms.MessageBox]::Show("Esportazione non riuscita:`r`n$($_.Exception.Message)", 'Software Update Checker',
+            [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Error)
+        return
+    }
+
+    # Ricordiamo cartella e formato per la prossima volta
+    Save-PreferenzeEsportazione -Cartella (Split-Path $dlg.FileName -Parent) -Formato $formato
+
+    $apri = [Windows.Forms.MessageBox]::Show("Esportati $(@($righe).Count) programmi in:`r`n$($dlg.FileName)`r`n`r`nVuoi aprire il file?",
+        'Software Update Checker', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Information)
+    if ($apri -eq [Windows.Forms.DialogResult]::Yes) { Invoke-Item -LiteralPath $dlg.FileName }
+}
+
+function Save-PreferenzeEsportazione {
+    <#
+        Ricorda ultima cartella e ultimo formato di esportazione in stato.json.
+        Aggiorna SOLO quella voce: non tocca data dell'ultimo controllo, fallimenti e inventario,
+        così funziona anche in modalità Info. In -Test non salva nulla.
+    #>
+    param([string]$Cartella, [string]$Formato)
+
+    $pref = [pscustomobject]@{ Cartella = $Cartella; Formato = $Formato }
+    if ($script:StatoFinestra) {
+        $script:StatoFinestra | Add-Member -Force -NotePropertyName Esportazione -NotePropertyValue $pref
+    }
+    if ($Test) { return }
+
+    try {
+        $suDisco = Read-Json $FileStato
+        if (-not $suDisco) { $suDisco = [pscustomobject]@{} }
+        $suDisco | Add-Member -Force -NotePropertyName Esportazione -NotePropertyValue $pref
+        $temporaneo = "$FileStato.tmp"
+        [IO.File]::WriteAllText($temporaneo, ($suDisco | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($true)))
+        Move-Item -LiteralPath $temporaneo -Destination $FileStato -Force
+    }
+    catch {
+        Write-Log "Preferenze di esportazione non salvate: $($_.Exception.Message)" 'AVVISO'
+    }
+}
+
 function Invoke-ModificaListe {
     <# Modifica le liste, le salva, ricalcola la classificazione e aggiorna la finestra #>
     param($Programmi, [string]$Azione, [string]$Lista)
 
-    $messaggi = Edit-Liste -Liste $script:ListeFinestra -Programmi $Programmi -Azione $Azione -Lista $Lista
+    $messaggi = @(Edit-Liste -Liste $script:ListeFinestra -Programmi $Programmi -Azione $Azione -Lista $Lista)
     foreach ($m in $messaggi) { Write-Log $m.Testo $m.Livello }
+
+    # Le cose "non fatte" le mostriamo anche in una finestra: il log da solo potrebbe sfuggire
+    $avvisi = @($messaggi | Where-Object { $_.Livello -eq 'AVVISO' })
+    if ($avvisi.Count) {
+        [void][Windows.Forms.MessageBox]::Show("Alcune operazioni non sono state eseguite:`r`n`r`n" +
+            (($avvisi | ForEach-Object { "   • $($_.Testo)" }) -join "`r`n"), 'Software Update Checker',
+            [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning)
+    }
 
     if ($Test) {
         Write-Log 'Simulazione: liste.json NON salvato (le modifiche valgono solo per questa finestra).' 'AVVISO'
@@ -1380,6 +1751,7 @@ function Show-Finestra {
     # --- schede ---
     $schede = New-Object Windows.Forms.TabControl
     $schede.Dock = 'Fill'
+    $script:SchedeFinestra = $schede
     $tAgg   = New-Object Windows.Forms.TabPage; $tAgg.Text   = 'Aggiornamenti'
     $tSis   = New-Object Windows.Forms.TabPage; $tSis.Text   = 'Sistema'
     $tListe = New-Object Windows.Forms.TabPage; $tListe.Text = 'Liste'
@@ -1416,7 +1788,7 @@ function Show-Finestra {
     Connect-Azioni $bSis $vSis
 
     # Scheda Tutti i programmi
-    $bTutti = New-PannelloAzioni -Contenitore $tTutti -ConEsporta
+    $bTutti = New-PannelloAzioni -Contenitore $tTutti
     $vTutti = New-Vista -Contenitore $tTutti -Colonne $colTutti -Filtri @('Stato', 'Attenzione', 'Tipo', 'Lista') -Caselle `
               -Fonte { $script:InventarioFinestra }
     Connect-Azioni $bTutti $vTutti
@@ -1502,10 +1874,33 @@ function Show-Finestra {
         else { $pannello.Height = 170; $this.Text = '▼ Nascondi' }
     })
 
+    # --- barra di avanzamento (visibile solo durante gli aggiornamenti) ---
+    $script:PannelloStato = New-Object Windows.Forms.FlowLayoutPanel
+    $script:PannelloStato.Dock = 'Bottom'; $script:PannelloStato.Height = 30
+    $script:PannelloStato.Padding = New-Object Windows.Forms.Padding(6, 4, 6, 0)
+    $script:PannelloStato.Visible = $false
+    $script:BarraAvanzamento = New-Object Windows.Forms.ProgressBar
+    $script:BarraAvanzamento.Width = 320; $script:BarraAvanzamento.Height = 18
+    $script:EtichettaStato = New-Object Windows.Forms.Label
+    $script:EtichettaStato.AutoSize = $true
+    $script:EtichettaStato.Margin = New-Object Windows.Forms.Padding(10, 3, 0, 0)
+    $script:PannelloStato.Controls.AddRange(@($script:BarraAvanzamento, $script:EtichettaStato))
+
     # Ordine di aggiunta: prima ciò che riempie (Fill), poi i bordi
     $form.Controls.Add($schede)
+    $form.Controls.Add($script:PannelloStato)
     $form.Controls.Add($pLog)
     $form.Controls.Add($script:TestataFinestra)
+
+    # Durante gli aggiornamenti la finestra non si chiude
+    $form.Add_FormClosing({
+        param($s, $e)
+        if ($script:AggiornamentoInCorso) {
+            $e.Cancel = $true
+            [void][Windows.Forms.MessageBox]::Show('Attendi la fine degli aggiornamenti prima di chiudere.', 'Software Update Checker',
+                [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information)
+        }
+    })
 
     # Le righe di log scritte prima che la finestra esistesse
     foreach ($r in $script:LogSessione) { Add-LogFinestra $r.Riga $r.Livello }
@@ -1611,7 +2006,7 @@ try {
     }
 
     # --- Fase 4: report e memoria ---
-    $blocco = New-BloccoReport -Inventario $inventario -Stato $stato -RisultatiAuto $risultatiAuto
+    $blocco = New-BloccoReport -Inventario $inventario -Stato $stato -RisultatiAuto $risultatiAuto -RisultatiFinestra $script:RisultatiFinestra.ToArray()
     Write-Report -Inventario $inventario -Blocco $blocco -Cartella $cartellaReport
 
     if (-not $Test) { Save-Stato -Stato $stato -Inventario $inventario }
