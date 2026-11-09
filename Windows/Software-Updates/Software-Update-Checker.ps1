@@ -13,6 +13,11 @@
       -ApriCartella : apre la cartella dei report ed esce
       -ProvaNotifiche : mostra un esempio di ogni notifica ed esce (per collaudo)
       -DaNotifica   : uso interno - lo passa Windows quando clicchi un pulsante di una notifica
+
+    Dove stanno le cose (fase 7):
+      Programma : C:\Program Files\Software-Update-Checker\   (lo installa Install-SoftwareUpdateChecker.ps1)
+      Dati      : %LOCALAPPDATA%\Software-Update-Checker\      (config.json, liste.json, stato.json, icona)
+      Report    : la cartella indicata in config.json (CartellaReport)
 #>
 [CmdletBinding()]
 param(
@@ -31,13 +36,19 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------
 #  PERCORSI DI BASE
 # ---------------------------------------------------------------
+#  Il programma sta in Program Files (protetto: solo un amministratore può modificarlo).
+#  I DATI stanno nella cartella personale dell'utente, scrivibile anche senza permessi
+#  da amministratore: così "Situazione attuale" e il menu Info possono salvare le liste.
+#  Sia la copia del repo sia quella installata usano gli STESSI dati.
 $CartellaScript = $PSScriptRoot
-$FileConfig     = Join-Path $CartellaScript 'config.json'
-$FileListe      = Join-Path $CartellaScript 'liste.json'
-$FileStato      = Join-Path $CartellaScript 'stato.json'
+$CartellaDati   = Join-Path $env:LOCALAPPDATA 'Software-Update-Checker'
+$FileConfig     = Join-Path $CartellaDati 'config.json'
+$FileListe      = Join-Path $CartellaDati 'liste.json'
+$FileStato      = Join-Path $CartellaDati 'stato.json'
+$script:PercorsoInstallato = Join-Path $env:ProgramFiles 'Software-Update-Checker\Software-Update-Checker.ps1'
 
-# Finché non leggiamo la config, eventuali errori vanno nella cartella dello script
-$script:CartellaLog = $CartellaScript
+# Finché non leggiamo la config, eventuali errori vanno nella cartella dei dati
+$script:CartellaLog = $CartellaDati
 
 # Perché è partito il controllo (lo scrive Test-DeveEseguire, lo legge il report)
 $script:MotivoEsecuzione = ''
@@ -74,6 +85,35 @@ function Write-Log {
     if ($Livello -ne 'INFO') {
         $fileLog = Join-Path $script:CartellaLog ('Errori_{0}.log' -f (Get-Date -Format 'yyyy-MM'))
         Add-Content -LiteralPath $fileLog -Value $riga -Encoding UTF8
+    }
+}
+
+function Initialize-CartellaDati {
+    <#
+        Prepara la cartella dei dati. La prima volta, se trova config/liste/stato
+        accanto allo script (vecchia posizione, nella cartella del repo), li COPIA
+        nella nuova cartella e rinomina gli originali in *.migrato.bak.
+        Se manca del tutto config.json, lo crea da config.example.json.
+    #>
+    if (-not (Test-Path -LiteralPath $CartellaDati)) {
+        New-Item -ItemType Directory -Path $CartellaDati -Force | Out-Null
+    }
+    if ($CartellaScript -ne $CartellaDati) {
+        foreach ($nome in 'config.json', 'liste.json', 'stato.json') {
+            $vecchio = Join-Path $CartellaScript $nome
+            $nuovo   = Join-Path $CartellaDati $nome
+            if ((Test-Path -LiteralPath $vecchio) -and -not (Test-Path -LiteralPath $nuovo)) {
+                Copy-Item -LiteralPath $vecchio -Destination $nuovo
+                Write-Log "Dati spostati: $nome -> $CartellaDati"
+                try   { Rename-Item -LiteralPath $vecchio -NewName "$nome.migrato.bak" }
+                catch { Write-Log "Non riesco a rinominare il vecchio $vecchio (non è più usato): $($_.Exception.Message)" 'AVVISO' }
+            }
+        }
+    }
+    $esempio = Join-Path $CartellaScript 'config.example.json'
+    if (-not (Test-Path -LiteralPath $FileConfig) -and (Test-Path -LiteralPath $esempio)) {
+        Copy-Item -LiteralPath $esempio -Destination $FileConfig
+        Write-Log "Creato config.json dall'esempio in $CartellaDati : controlla la cartella dei report." 'AVVISO'
     }
 }
 
@@ -2009,10 +2049,10 @@ function Get-IconaNotifiche {
     <#
         Crea (una volta sola) una piccola icona PNG per le notifiche:
         un quadrato blu arrotondato con il simbolo "sincronizza" di Windows.
-        Finisce in %LOCALAPPDATA%\Software-Update-Checker (fuori dal repo).
+        Finisce nella cartella dei dati, %LOCALAPPDATA%\Software-Update-Checker (fuori dal repo).
     #>
     try {
-        $cartella = Join-Path $env:LOCALAPPDATA 'Software-Update-Checker'
+        $cartella = $CartellaDati
         $png = Join-Path $cartella 'icona-notifiche.png'
         if (Test-Path -LiteralPath $png) { return $png }
         if (-not (Test-Path -LiteralPath $cartella)) { New-Item -ItemType Directory -Path $cartella -Force | Out-Null }
@@ -2059,7 +2099,10 @@ function Register-Notifiche {
 
         # Il protocollo: lancia lo script in modo non elevato e con la console nascosta
         $chiaveProt = "HKCU:\Software\Classes\$script:ProtocolloNotifiche"
-        $comando = '"{0}\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -DaNotifica "%1"' -f $env:SystemRoot, $PSCommandPath
+        # Lo script da lanciare: quello installato, se c'è (protetto); altrimenti questo.
+        # conhost --headless: nessuna finestra nera, nemmeno per un istante.
+        $daLanciare = if (Test-Path -LiteralPath $script:PercorsoInstallato) { $script:PercorsoInstallato } else { $PSCommandPath }
+        $comando = '"{0}\System32\conhost.exe" --headless "{0}\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -DaNotifica "%1"' -f $env:SystemRoot, $daLanciare
         Set-ValoreRegistro $chiaveProt '(default)' 'URL:Software Update Checker'
         Set-ValoreRegistro $chiaveProt 'URL Protocol' ''
         Set-ValoreRegistro "$chiaveProt\shell\open\command" '(default)' $comando
@@ -2243,8 +2286,9 @@ function Show-ProvaNotifiche {
 #  PROGRAMMA PRINCIPALE
 # ---------------------------------------------------------------
 try {
+    Initialize-CartellaDati
     $config = Read-Json $FileConfig
-    if (-not $config) { throw "File di configurazione non trovato: $FileConfig" }
+    if (-not $config) { throw "File di configurazione non trovato: $FileConfig (rilancia Install-SoftwareUpdateChecker.ps1)" }
 
     # Clic su un pulsante di una notifica: si fa SOLO l'azione richiesta.
     # Ogni altro parametro viene ignorato (l'indirizzo arriva "da fuori").
@@ -2273,7 +2317,7 @@ try {
     }
 
     # Cartella report: la creiamo se manca; se non si può (es. disco D: assente) ripieghiamo
-    $cartellaReport = $CartellaScript
+    $cartellaReport = $CartellaDati
     try {
         if (-not (Test-Path -LiteralPath $config.CartellaReport)) {
             New-Item -ItemType Directory -Path $config.CartellaReport -Force | Out-Null
@@ -2282,7 +2326,7 @@ try {
         $script:CartellaLog = $config.CartellaReport
     }
     catch {
-        Write-Log "Impossibile usare la cartella report '$($config.CartellaReport)': $($_.Exception.Message). Uso la cartella dello script." 'AVVISO'
+        Write-Log "Impossibile usare la cartella report '$($config.CartellaReport)': $($_.Exception.Message). Uso la cartella dei dati." 'AVVISO'
     }
 
     $stato = Initialize-Stato (Read-Json $FileStato)

@@ -1,5 +1,5 @@
 ﻿// ============================================================================
-// Nilesoft Shell - V15.3 DESKTOP BACKGROUND
+// Nilesoft Shell - V15.4 DESKTOP BACKGROUND
 //
 // Scope:
 //   - clic destro sullo spazio vuoto del Desktop (type='desktop');
@@ -21,6 +21,10 @@
 //   - Mp3tag -> Programmi; Apri con Code -> Sviluppo; Apri nel Terminale -> Terminale.
 //   - "Trasferisci copia..." (Dropbox) resta nativa: le voci Dropbox non accettano parent=.
 //
+// Novità V15.4 (Software Update Checker, fase 7):
+//   - lo script ora è installato in C:/Program Files/Software-Update-Checker/;
+//   - voce "Situazione attuale (Info)" attiva.
+//
 // Note:
 //   - Restart Explorer, Safe Mode, Appearance: voci di Winaero Tweaker (registro).
 //   - I percorsi usano "/" invece di "\": Windows li accetta uguali.
@@ -29,11 +33,11 @@
 
 // ---------------------------------------------------------------------------
 // PERCORSO DELLO SCRIPT
-//   FASE DI SVILUPPO : cartella del repository (attuale)
-//   FASE 7           : sostituire con 'C:/Program Files/Software-Update-Checker/Software-Update-Checker.ps1'
+//   Copia INSTALLATA (protetta: solo un amministratore può modificarla).
+//   La installa/aggiorna Install-SoftwareUpdateChecker.ps1 dal repository.
 // ---------------------------------------------------------------------------
 
-$suc_script = 'C:/Users/Nirva/source/repos/Personal-Admin-Tools/Windows/Software-Updates/Software-Update-Checker.ps1'
+$suc_script = 'C:/Program Files/Software-Update-Checker/Software-Update-Checker.ps1'
 
 
 // ---------------------------------------------------------------------------
@@ -100,7 +104,6 @@ menu(type='desktop' where=path.exists(suc_script)
          cmd='powershell.exe'
          args='-NoProfile -NoExit -File "@suc_script" -Forza -Dettagli')
 
-    // Finestra in sola consultazione (attivata con la fase 5a)
     item(title='Situazione attuale (Info)'
          image=icon.details
          cmd='powershell.exe'
